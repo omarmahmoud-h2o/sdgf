@@ -1,4 +1,4 @@
-"""Hand-built FAG records that each fail exactly one of L1, L2, L3 or L4.
+"""Hand-built FAG records that each fail exactly one of L1, L2, L3, L4 or L5.
 
 Each record starts from a valid seed and breaks one thing, then runs through the
 L1 -> L2 -> L3 -> L4 cascade the pipeline builds. The cascade must stop at the expected
@@ -7,14 +7,19 @@ repairable; L3 and L4 failures are hard drops.
 
 A seed is itself a copy of a seed, so unmodified seeds pass L1-L3 and stop at L4. The L3
 cases fail before L4 is reached; the near-duplicate case uses fresh fictional text.
+The L5 case is a "no breach" record whose assistant turn advises: it passes L1-L4 and
+only the blind judge catches it, closing the §12.2 blind spot.
 """
 
 import copy
+import json
 
 import pytest
 
 from pathlib import Path
 
+from sdgf.generate.generator import Generator
+from sdgf.judge.llm_judge import RECORD_HEADER, LLMJudge
 from sdgf.models.mock import MockBackend
 from sdgf.pipeline import Pipeline
 from sdgf.spec.compile import compile_spec
@@ -24,6 +29,8 @@ from sdgf.validate.l1_schema import SchemaLayer
 from sdgf.validate.l2_rules import RulesLayer
 from sdgf.validate.l3_governance import GovernanceLayer
 from sdgf.validate.l4_overlap import OverlapLayer
+from sdgf.validate.l5_judge import JudgeLayer
+from sdgf.validate.repair import FEEDBACK_HEADER, RepairLoop
 
 FAG_DIR = Path(__file__).resolve().parents[1] / "tasks" / "fag"
 
@@ -263,3 +270,104 @@ def test_near_duplicate_of_an_accepted_record_stops_at_l4(cascade, seeds):
     assert_hard_drop_at(result, "L4", ["near_duplicate"])
     assert result.errors[0].details["match"] == "SYN-FAG-000001"
     assert result.errors[0].details["score"] > 0.8
+
+
+# --- L5 -------------------------------------------------------------------------------
+# The §12.2 blind spot: the original pipeline had no check that the text matches its
+# label, so a "no breach" record whose assistant turn advises passed as long as its
+# spans were empty. L1-L4 still can't see it (the label agrees with tier and scope, and
+# there are no spans to check); the blind L5 judge reading the conversation does.
+
+WITH_L5 = ALL + ("L5",)
+MODEL_FIELDS = ("messages", "spans", "problematic_turns", "customer_intent", "reasoning_summary")
+ADVICE = (
+    "Honestly, the trade card is ideal for your business. Move the timber orders onto it "
+    "and you'll stretch your cash flow by almost a month."
+)
+
+
+def advising_non_breach(seeds) -> dict:
+    """A non-breach Corps Act record whose last assistant turn gives personal advice."""
+    r = fresh_record(seeds)
+    r["messages"][3]["content"] = ADVICE
+    assert r["label"] is False and r["product_scope"] == "corps_act"
+    assert r["advice_tier"] == "FACTUAL_INFORMATION" and r["signal_categories"] == []
+    assert r["spans"] == []
+    return r
+
+
+def judge_reply(verdict, conf=0.9):
+    tier = "PERSONAL_ADVICE" if verdict == "breach" else "FACTUAL_INFORMATION"
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "scores": {"advice_tier": tier, "realism": 4},
+            "confidence": {"verdict": conf, "advice_tier": conf, "realism": 0.9},
+        }
+    )
+
+
+def cascade_with_judge(fag, verdicts):
+    judge_backend = MockBackend([judge_reply(v) for v in verdicts])
+    layers = {
+        "L1": SchemaLayer.from_spec(fag),
+        "L2": RulesLayer.from_spec(fag),
+        "L3": GovernanceLayer.from_spec(fag),
+        "L4": OverlapLayer.from_spec(fag),
+        "L5": JudgeLayer.from_spec(fag, LLMJudge.from_spec(fag, judge_backend)),
+    }
+    return Cascade.from_config(list(WITH_L5), layers), judge_backend
+
+
+def test_advising_non_breach_passes_l1_to_l4(cascade, seeds):
+    result = run(cascade, advising_non_breach(seeds))
+    assert result.passed, result.errors
+    assert result.layers_run == ALL
+
+
+def test_advising_non_breach_is_caught_at_l5(fag, seeds):
+    r = advising_non_breach(seeds)
+    cascade5, judge_backend = cascade_with_judge(fag, ["breach"])
+    result = cascade5.run(r, ValidationContext(cell_id="test", recipe=r))
+
+    assert result.failed_layer == "L5"
+    assert result.layers_run == WITH_L5
+    assert all(v.outcome == "pass" for v in result.verdicts[:-1])
+    assert result.repairable and not result.hard
+    assert [e.code for e in result.errors] == ["judge_disagrees"]
+    assert result.verdicts[-1].details["agrees"] is False
+
+    # The judge was blind: it saw only the conversation, never the label or the spans.
+    (call,) = judge_backend.calls
+    shown = json.loads(call.prompt.split(RECORD_HEADER + "\n", 1)[1])
+    assert set(shown) == {"messages"}
+    assert ADVICE in call.prompt
+
+
+def test_same_record_passes_when_the_judge_agrees(fag, seeds):
+    # Control: L5 is the only layer that decides here, so an agreeing judge accepts it.
+    r = advising_non_breach(seeds)
+    cascade5, _ = cascade_with_judge(fag, ["no_breach"])
+    result = cascade5.run(r, ValidationContext(cell_id="test", recipe=r))
+    assert result.passed, result.errors
+    assert result.layers_run == WITH_L5
+
+
+def test_l5_disagreement_is_repaired_in_the_same_cell(fag, seeds):
+    clean = fresh_record(seeds)
+    recipe = {k: v for k, v in clean.items() if k not in MODEL_FIELDS}
+    model = {k: clean[k] for k in MODEL_FIELDS}
+    advising = {**model, "messages": advising_non_breach(seeds)["messages"]}
+
+    generator = Generator(fag, MockBackend([json.dumps(advising), json.dumps(model)]))
+    cascade5, judge_backend = cascade_with_judge(fag, ["breach", "no_breach"])
+    loop = RepairLoop(generator, cascade5)
+    out = loop.run("corps_act|false|short", recipe, generator.prompts.build(recipe))
+
+    assert out.accepted and out.repairs == 1
+    assert out.history == [("L5", ("judge_disagrees",))]
+    assert out.record["label"] is False
+    assert out.record["messages"][3]["content"] == clean["messages"][3]["content"]
+    second_prompt = generator.backend.calls[1].prompt
+    assert FEEDBACK_HEADER in second_prompt and "judge_disagrees" in second_prompt
+    assert len(judge_backend.calls) == 2
