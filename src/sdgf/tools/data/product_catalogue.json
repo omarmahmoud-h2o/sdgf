@@ -1,0 +1,47 @@
+{
+  "products": [
+    {
+      "product_code": "TST-ACC-001",
+      "name": "Zebra Test Everyday Business Account",
+      "category": "transaction_account",
+      "monthly_fee_aud": 10.0,
+      "features": ["unlimited electronic transactions", "online banking portal"],
+      "corps_act_product": false
+    },
+    {
+      "product_code": "TST-CRD-001",
+      "name": "Zebra Test Business Card",
+      "category": "credit_card",
+      "annual_fee_aud": 0.0,
+      "purchase_rate_pct": 12.5,
+      "features": ["up to 55 days interest free on purchases", "expense reporting export"],
+      "corps_act_product": false
+    },
+    {
+      "product_code": "TST-LND-001",
+      "name": "Zebra Test Equipment Loan",
+      "category": "business_loan",
+      "establishment_fee_aud": 250.0,
+      "variable_rate_pct": 8.25,
+      "features": ["terms from 1 to 5 years", "fixed monthly repayments"],
+      "corps_act_product": false
+    },
+    {
+      "product_code": "TST-TD-001",
+      "name": "Zebra Test Business Term Deposit",
+      "category": "term_deposit",
+      "minimum_deposit_aud": 5000.0,
+      "rate_pct_12_months": 4.1,
+      "features": ["terms from 1 to 60 months", "interest paid at maturity"],
+      "corps_act_product": true
+    },
+    {
+      "product_code": "TST-FX-001",
+      "name": "Zebra Test Foreign Currency Forward",
+      "category": "fx_hedging",
+      "minimum_contract_aud": 10000.0,
+      "features": ["lock in an exchange rate for a future date"],
+      "corps_act_product": true
+    }
+  ]
+}

@@ -16,9 +16,12 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict
 from typing import Any
 
 from sdgf.store.artefacts import ArtefactStore, JsonlWriter, iter_jsonl
+from sdgf.store.provenance import ToolTraceEntry
 
 CACHE_STREAM = "tool_cache"
 
@@ -54,6 +57,20 @@ class ToolCache:
                 if key != cache_key(tool, arguments):
                     raise ToolCacheError(f"{self.path}:{lineno}: key does not match its call")
                 self._entries[key] = result
+
+    @classmethod
+    def from_trace(cls, trace: Iterable[ToolTraceEntry | Mapping[str, Any]]) -> ToolCache:
+        """An in-memory cache holding every successful call in a record's tool trace.
+
+        With it (and no handlers), a gateway answers the record's calls exactly as the
+        original run did, so the record can be replayed from its provenance alone.
+        """
+        cache = cls()
+        for entry in trace:
+            e = asdict(entry) if isinstance(entry, ToolTraceEntry) else entry
+            if e.get("error") is None:
+                cache.put(e["tool"], e.get("arguments", {}), e.get("result"))
+        return cache
 
     @classmethod
     def for_store(cls, store: ArtefactStore, spec_version: str) -> ToolCache:
