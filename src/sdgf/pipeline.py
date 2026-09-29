@@ -3,7 +3,7 @@
     0 intake     compile task.yaml + hooks.py + seeds, resolve the task type
     - cells      fixed axes crossed into cells with quotas (stand-in until stage 1, M5)
     2 generate   scheduler ─► sampler_constraints ─► prompt ─► generator backend
-    3 validate   cascade (L1-L4 for now) ─► repair ─► accepted + provenance | drop log
+    3 validate   cascade L1-L6 ─► repair ─► accepted + provenance | drop log
 
 Run artefacts live in an ArtefactStore run directory keyed by spec_version:
 
@@ -12,6 +12,7 @@ Run artefacts live in an ArtefactStore run directory keyed by spec_version:
     accepted.jsonl accepted records, post_processed, with provenance under _provenance
     drops.jsonl    every dropped candidate with cell, layer, codes and reason
     summary.json   the scheduler snapshot and drop counts at the end of the run
+    review.jsonl   records L5 queued for people, when hitl.review_flagged and no sink is given
 
 Reopening an existing run id resumes it: accepted counts are restored per cell from
 accepted.jsonl, and per-candidate seeds continue from where the run stopped, so a
@@ -22,8 +23,11 @@ L3 (governance) and L4 (overlap) failures are hard drops, never repaired. The L4
 check runs only when held_out_paths is passed to the Pipeline; the path is a run-time
 argument, not recorded in any run artefact, and held-out text never reaches a prompt.
 
-L1-L4 are implemented; enabled layers without an implementation are reported as skipped
-in spec.json and summary.json rather than silently ignored.
+L5 (judge) and L6 (consistency) build the judge stage, and the fallback judge only when
+the rubric may ask for reasons, so the D12 endpoint record names only models that get
+data. The judge counts as trusted when a calibration result for this spec_version and
+judge model is in the store (judge/calibration.py), or one is passed in. Layers the run
+leaves out are reported as skipped in spec.json and summary.json, never silently ignored.
 """
 
 from __future__ import annotations
@@ -34,17 +38,21 @@ import json
 import logging
 import random
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from sdgf.generate.generator import Generator
+from sdgf.judge.calibration import CalibrationResult, CalibrationStore
+from sdgf.judge.interface import Judge
+from sdgf.judge.llm_judge import LLMJudge
 from sdgf.generate.scheduler import Cell, Scheduler
 from sdgf.models.base import ModelBackend
 from sdgf.models.registry import StageModels, build_models
 from sdgf.spec.compile import CompiledSpec, compile_spec
 from sdgf.spec.schema import CoverageSection
-from sdgf.store.artefacts import ArtefactStore, RunDir
+from sdgf.store.artefacts import ArtefactStore, JsonlWriter, RunDir
 from sdgf.store.provenance import PROVENANCE_KEY, ProvenanceBuilder, attach
 from sdgf.tasktypes.base import TaskType
 from sdgf.tasktypes.registry import REGISTRY as TASK_TYPES
@@ -54,15 +62,18 @@ from sdgf.validate.l1_schema import SchemaLayer
 from sdgf.validate.l2_rules import RulesLayer
 from sdgf.validate.l3_governance import GovernanceLayer
 from sdgf.validate.l4_overlap import OverlapLayer
+from sdgf.validate.l5_judge import JudgeLayer, ReviewItem, ReviewSink
+from sdgf.validate.l6_consistency import Answerer, ConsistencyLayer
 from sdgf.validate.repair import GENERATE_STAGE, Drop, DropLog, RepairLoop
 
 log = logging.getLogger(__name__)
 
-IMPLEMENTED_LAYERS: tuple[str, ...] = ("L1", "L2", "L3", "L4")
-USED_STAGES: tuple[str, ...] = ("generator",)  # model stages run so far; judge arrives with L5
+IMPLEMENTED_LAYERS: tuple[str, ...] = ("L1", "L2", "L3", "L4", "L5", "L6")
+JUDGE_LAYERS: tuple[str, ...] = ("L5", "L6")
 
 ACCEPTED_STREAM = "accepted"
 DROPS_STREAM = "drops"
+REVIEW_STREAM = "review"
 
 
 class PipelineError(ValueError):
@@ -152,6 +163,18 @@ def _bare(record: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in record.items() if k != PROVENANCE_KEY}
 
 
+class RunReviewSink:
+    """Writes L5 review items to the open run's review stream (until the M8 queue)."""
+
+    def __init__(self) -> None:
+        self.writer: JsonlWriter | None = None
+
+    def submit(self, item: ReviewItem) -> None:
+        if self.writer is None:
+            raise PipelineError("review item submitted outside a run")
+        self.writer.write(item.to_dict())
+
+
 @dataclass
 class RunResult:
     run: RunDir
@@ -180,6 +203,9 @@ class Pipeline:
         layers: Sequence[str] | None = None,
         max_attempts_per_cell: int | None = None,
         held_out_paths: Iterable[str | Path] | None = None,
+        calibration: CalibrationResult | None = None,
+        review: ReviewSink | None = None,
+        answerer: Answerer | None = None,
     ):
         # Stage 0: spec schema and hook signatures are checked on load; the task type
         # and its generation mode are resolved here, before any model is built.
@@ -209,33 +235,110 @@ class Pipeline:
 
         # Only the stages this pipeline uses are built, so provenance and the D12
         # endpoint record name exactly the models that received data.
+        self.used_stages = self._used_stages()
         overrides = dict(model_overrides or {})
-        unused = sorted(set(overrides) - set(USED_STAGES))
+        unused = sorted(set(overrides) - set(self.used_stages))
         if unused:
-            raise PipelineError(f"model overrides for stages {unused} that are not run yet")
-        spec_models = self.compiled.spec.models.model_copy(
-            update={"judge": None, "fallback_judge": None, "expansion": None}
+            raise PipelineError(
+                f"model overrides for stages {unused} that this run doesn't use; "
+                f"it uses {list(self.used_stages)}"
+            )
+        spec_models = self.compiled.spec.models
+        missing = [
+            st
+            for st in self.used_stages
+            if getattr(spec_models, st) is None and st not in overrides
+        ]
+        if missing:
+            raise PipelineError(f"layers {list(self.layers)} need models {missing}; none is set")
+        spec_models = spec_models.model_copy(
+            update={
+                st: None
+                for st in ("judge", "fallback_judge", "expansion")
+                if st not in self.used_stages
+            }
         )
         self.models: StageModels = build_models(spec_models, overrides)
         self.generator = Generator(
             self.compiled, self.models.backend("generator"), task_type=self.task_type
         )
-        implementations = self._layer_implementations()
+        self.review_sink: RunReviewSink | None = None
+        if review is None and self.compiled.spec.hitl.review_flagged and "L5" in self.layers:
+            self.review_sink = RunReviewSink()
+            review = self.review_sink
+        self.judge: Judge | None = None
+        self.trusted = False
+        implementations = self._layer_implementations(calibration, review, answerer)
         overlap = implementations.get("L4")
         assert overlap is None or isinstance(overlap, OverlapLayer)
         self.overlap: OverlapLayer | None = overlap
         self.cascade = Cascade.from_config(self.layers, implementations)
 
-    def _layer_implementations(self) -> dict[str, Layer]:
+    def _used_stages(self) -> tuple[str, ...]:
+        stages = ["generator"]
+        if any(n in JUDGE_LAYERS for n in self.layers):
+            stages.append("judge")
+        # The fallback judge only writes reasons, so it gets data only if the rubric asks.
+        spec = self.compiled.spec
+        if (
+            "L5" in self.layers
+            and spec.models.fallback_judge is not None
+            and spec.rubric.reason_required != "never"
+        ):
+            stages.append("fallback_judge")
+        return tuple(stages)
+
+    def _judge_id(self) -> str:
+        """The judge model a calibration must belong to: the backend actually built."""
+        backend = self.models.backend("judge")
+        return f"{backend.name}:{backend.model}"
+
+    def _layer_implementations(
+        self,
+        calibration: CalibrationResult | None,
+        review: ReviewSink | None,
+        answerer: Answerer | None,
+    ) -> dict[str, Layer]:
         """Only the enabled layers are built, so e.g. L4 doesn't need overlap_max without L4."""
+        if self.held_out_paths is not None and "L4" not in self.layers:
+            raise PipelineError("held_out_paths needs L4 enabled")
+        judge_name = None
+        if "judge" in self.used_stages:
+            self.judge = LLMJudge.from_spec(self.compiled, self.models.backend("judge"))
+            judge_name = self._judge_id()
+            if calibration is None:
+                calibration = CalibrationStore(self.store).load(
+                    self.compiled.spec_version, judge_name
+                )
+            self.trusted = calibration is not None and calibration.trusts(
+                self.compiled.spec_version, judge_name
+            )
+        fallback = None
+        if "fallback_judge" in self.used_stages:
+            fallback = LLMJudge.from_spec(
+                self.compiled, self.models.backend("fallback_judge"), stage="fallback_judge"
+            )
         build = {
             "L1": lambda: SchemaLayer.from_spec(self.compiled, self.task_type),
             "L2": lambda: RulesLayer.from_spec(self.compiled),
             "L3": lambda: GovernanceLayer.from_spec(self.compiled),
             "L4": lambda: OverlapLayer.from_spec(self.compiled, held_out_paths=self.held_out_paths),
+            "L5": lambda: JudgeLayer.from_spec(
+                self.compiled,
+                self.judge,
+                review=review,
+                fallback_judge=fallback,
+                calibration=calibration,
+                judge_name=judge_name,
+            ),
+            "L6": lambda: ConsistencyLayer.from_spec(
+                self.compiled,
+                judge=self.judge,
+                answerer=answerer,
+                calibration=calibration,
+                judge_name=judge_name,
+            ),
         }
-        if self.held_out_paths is not None and "L4" not in self.layers:
-            raise PipelineError("held_out_paths needs L4 enabled")
         return {name: build[name]() for name in self.layers}
 
     def _intake_summary(self) -> dict[str, Any]:
@@ -250,6 +353,7 @@ class Pipeline:
             "layers": list(self.layers),
             "skipped_layers": list(self.skipped_layers),
             "held_out_check": self.held_out_paths is not None,
+            "judge_trusted": self.trusted,
             "models": self.models.endpoints(),
         }
 
@@ -282,8 +386,12 @@ class Pipeline:
         tried = {c.id: prior_accepted[c.id] + prior_drops[c.id] for c in cells}
 
         accepted: list[dict[str, Any]] = []
-        with run.jsonl(ACCEPTED_STREAM) as out, run.jsonl(DROPS_STREAM) as drops_out:
-            drops = DropLog(drops_out)
+        with ExitStack() as streams:
+            out = streams.enter_context(run.jsonl(ACCEPTED_STREAM))
+            drops = DropLog(streams.enter_context(run.jsonl(DROPS_STREAM)))
+            if self.review_sink is not None:
+                self.review_sink.writer = streams.enter_context(run.jsonl(REVIEW_STREAM))
+                streams.callback(setattr, self.review_sink, "writer", None)
             loop = RepairLoop(self.generator, self.cascade, drop_log=drops)
             while (cell := scheduler.next_cell()) is not None:
                 seed = candidate_seed(self.seed, cell.id, tried[cell.id])

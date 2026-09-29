@@ -1,4 +1,8 @@
-"""Pipeline stages 0, 2 and 3 (L1-L4) end to end on the FAG spec with a MockBackend."""
+"""Pipeline stages 0, 2 and 3 end to end on the FAG spec with a MockBackend.
+
+Most tests run L1-L4 with only a generator mock; the judge layers (L5, L6) are covered in
+tests/test_m4_checkpoint.py, which pass a mock judge too.
+"""
 
 import hashlib
 import json
@@ -24,6 +28,7 @@ from sdgf.validate.base import ValidationContext
 
 FAG_DIR = Path(__file__).resolve().parents[1] / "tasks" / "fag"
 TARGET = 20
+NO_JUDGE = ("L1", "L2", "L3", "L4")  # runs that pass no judge mock leave L5/L6 out
 
 
 @pytest.fixture(scope="module")
@@ -97,12 +102,17 @@ def valid_backend(**kw):
     return MockBackend(lambda call: json.dumps(fag_reply(recipe_from_prompt(call.prompt))), **kw)
 
 
-def run(fag, tmp_path, backend, **kw):
+def run(fag, tmp_path, backend, *, judge=None, **kw):
     run_id = kw.pop("run_id", "r1")
+    overrides = {"generator": backend}
+    if judge is not None:
+        overrides["judge"] = judge
+    else:
+        kw.setdefault("layers", NO_JUDGE)
     pipe = Pipeline(
         fag,
         tmp_path / "store",
-        model_overrides={"generator": backend},
+        model_overrides=overrides,
         target_size=kw.pop("target_size", TARGET),
         **kw,
     )
@@ -275,9 +285,9 @@ def test_resume_with_a_different_target_is_refused(fag, tmp_path):
         run(fag, tmp_path, valid_backend(), target_size=TARGET + 1)
 
 
-def test_unimplemented_layers_are_refused(fag, tmp_path):
+def test_unknown_layers_are_refused(fag, tmp_path):
     with pytest.raises(PipelineError, match="not implemented"):
-        Pipeline(fag, tmp_path, model_overrides={"generator": valid_backend()}, layers=["L1", "L5"])
+        Pipeline(fag, tmp_path, model_overrides={"generator": valid_backend()}, layers=["L1", "L7"])
 
 
 def test_explicit_layer_subset(fag, tmp_path):
@@ -336,7 +346,11 @@ def test_near_duplicate_of_an_accepted_record_is_dropped(fag, tmp_path):
 def test_resume_rebuilds_the_near_duplicate_corpus(fag, tmp_path):
     _, done = run(fag, tmp_path, valid_backend())
     pipe = Pipeline(
-        fag, tmp_path / "store", model_overrides={"generator": valid_backend()}, target_size=TARGET
+        fag,
+        tmp_path / "store",
+        model_overrides={"generator": valid_backend()},
+        target_size=TARGET,
+        layers=NO_JUDGE,
     )
     assert pipe.overlap is not None and pipe.overlap.corpus_size == 0
     resumed = pipe.run("r1")  # already complete: nothing new, but the corpus is rebuilt
@@ -360,6 +374,7 @@ def test_held_out_check_is_opt_in(fag, tmp_path):
         model_overrides={"generator": valid_backend()},
         held_out_paths=[held],
         target_size=TARGET,
+        layers=NO_JUDGE,
     )
     assert pipe.overlap is not None and pipe.overlap.held_out_enabled
     result = pipe.run("r1")

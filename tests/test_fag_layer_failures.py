@@ -107,10 +107,16 @@ def fresh_record(seeds) -> dict:
     return r
 
 
-def test_the_pipeline_cascade_is_l1_to_l4(fag, tmp_path):
-    pipe = Pipeline(fag, tmp_path, model_overrides={"generator": MockBackend(["{}"])})
+def test_the_pipeline_cascade_is_l1_to_l4_before_the_judge(fag, tmp_path):
+    pipe = Pipeline(fag, tmp_path, model_overrides={"generator": MockBackend(["{}"])}, layers=ALL)
     assert pipe.cascade.names == ALL
     assert pipe.overlap is not None
+
+
+def test_the_full_pipeline_cascade_is_l1_to_l6(fag, tmp_path):
+    overrides = {"generator": MockBackend(["{}"]), "judge": MockBackend(["{}"])}
+    pipe = Pipeline(fag, tmp_path, model_overrides=overrides)
+    assert pipe.cascade.names == ALL + ("L5", "L6")
 
 
 def test_every_seed_passes_l1_to_l3(cascade, seeds):
