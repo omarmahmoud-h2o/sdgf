@@ -97,6 +97,11 @@ def _values(m: Metrics, distinct_n: int) -> dict[str, float | None]:
     }
 
 
+def threshold_values(m: Metrics, distinct_n: int = DEFAULT_DISTINCT_N) -> dict[str, float | None]:
+    """Threshold name -> the value of the metric it gates, for reports."""
+    return _values(m, distinct_n)
+
+
 # Thresholds where the value must stay at or under the threshold; the rest are minimums.
 _UPPER = frozenset(
     {
@@ -200,4 +205,5 @@ __all__ = [
     "GateFailure",
     "GateResult",
     "evaluate_gate",
+    "threshold_values",
 ]
