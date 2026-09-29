@@ -55,6 +55,8 @@ class TaskSection(_Section):
     type: str = Field(min_length=1)
     generation_mode: GenerationMode
     description: str = Field(min_length=1)
+    # For task types with pluggable answer extractors (sft_qa): which one to use.
+    answer_format: str | None = None
 
 
 # ── output_schema ────────────────────────────────────────────────

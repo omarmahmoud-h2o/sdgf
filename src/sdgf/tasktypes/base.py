@@ -9,6 +9,7 @@ A task type is the *kind* of dataset. It supplies what every task of that kind s
                          each takes a record and returns a list of errors (empty = pass)
     answer_extractor     text -> answer or None; required for answer_emergent, since
                          K-vote consistency has nothing to vote on without one (§12.1)
+    configure(task)      the instance for a spec, for types with options (answer_format)
     judge_fields         the record fields a judge may see; never the label or any
                          field that encodes it, since L5 judges blind (§6.4)
 
@@ -22,7 +23,7 @@ import copy
 from abc import ABC, abstractmethod
 from typing import Any, Callable, ClassVar
 
-from sdgf.spec.schema import Axis, FieldSpec, GenerationMode, OutputSchemaSection
+from sdgf.spec.schema import Axis, FieldSpec, GenerationMode, OutputSchemaSection, TaskSection
 
 Record = dict[str, Any]
 Validator = Callable[[Record], list[str]]
@@ -49,6 +50,14 @@ class TaskType(ABC):
 
     def answer_extractor(self) -> AnswerExtractor | None:
         return None
+
+    def configure(self, task: TaskSection) -> TaskType:
+        """The instance for a spec's task section; types with options override this."""
+        if task.answer_format is not None:
+            raise TaskTypeError(
+                f"task type {self.name!r} takes no answer_format, got {task.answer_format!r}"
+            )
+        return self
 
     def judge_fields(self) -> tuple[str, ...]:
         """Fields a blind judge sees: every type-owned field except the label."""

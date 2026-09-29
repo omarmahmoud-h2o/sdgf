@@ -39,8 +39,9 @@ class TaskTypeRegistry:
             ) from None
 
     def resolve(self, task: TaskSection) -> TaskType:
-        """The task type for a spec's task section, with its generation_mode checked."""
-        task_type = self.get(task.type)
+        """The task type for a spec's task section, configured by it, with its mode checked."""
+        task_type = self.get(task.type).configure(task)
+        task_type.check_definition()
         task_type.check_mode(task.generation_mode)
         return task_type
 

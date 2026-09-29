@@ -125,9 +125,10 @@ schema is in [src/sdgf/spec/schema.py](src/sdgf/spec/schema.py).
 | Key | Meaning |
 |---|---|
 | `name`, `version` | identify the task; used in release paths |
-| `type` | a registered task type, e.g. `classification_spans` |
+| `type` | a registered task type: `classification_spans` or `sft_qa` |
 | `generation_mode` | `label_first` (the label is fixed by the cell, and the model writes text that matches it) or `answer_emergent` (the model writes the answer, and L6 majority voting decides it) |
 | `description` | the task description; goes into the static prompt prefix |
+| `answer_format` | optional; for `sft_qa`, how answers are read out of text: `multiple_choice` (default), `yes_no_maybe`, `numeric` or `boxed_math` |
 
 ### `output_schema`
 
