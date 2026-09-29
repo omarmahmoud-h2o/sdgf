@@ -19,8 +19,8 @@ schema-valid answer is dropped rather than repaired, since regenerating the reco
 doesn't fix the judge; the drop log counts it so a broken judge shows up in metrics.
 
 Every verdict carries details for L6 and provenance: the judge result, agreement,
-low_confidence, and escalate (low confidence, a hard cell or a contestable record, per
-validation.escalation). When the rubric requires a reason (always, or flagged and the
+low_confidence, escalate (low confidence, a hard cell or a contestable record, per
+validation.escalation) and trusted (the judge's calibration passed, judge/calibration.py). When the rubric requires a reason (always, or flagged and the
 record was flagged by disagreement or low confidence), the fallback judge writes it and
 it goes into details, the review item and the disagreement message.
 """
@@ -30,7 +30,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Protocol
 
-from sdgf.judge.interface import Judge, JudgeError, JudgeParseError, JudgeResult
+from sdgf.judge.calibration import CalibrationResult, trust_for
+from sdgf.judge.interface import (
+    Judge,
+    JudgeError,
+    JudgeParseError,
+    JudgeResult,
+    verdict_means,
+)
 from sdgf.judge.llm_judge import judge_view
 from sdgf.spec.schema import EscalationRules
 from sdgf.validate.base import Layer, LayerVerdict, Record, ValidationContext, ValidationIssue
@@ -40,17 +47,6 @@ if TYPE_CHECKING:
 
 LABEL_FIELD = "label"
 HARD_DIFFICULTY = "hard"
-
-
-def verdict_means(labels: Mapping[str, Any], verdict: str, label: Any) -> bool:
-    """Whether a judge verdict means the intended label under rubric.verdict.labels."""
-    if verdict not in labels:
-        return False
-    meant = labels[verdict]
-    # True == 1 in Python; a bool label only agrees with a bool, and vice versa.
-    if isinstance(meant, bool) or isinstance(label, bool):
-        return type(meant) is type(label) and meant == label
-    return meant == label
 
 
 def escalates(
@@ -122,8 +118,10 @@ class JudgeLayer(Layer):
         escalation: EscalationRules | None = None,
         review: ReviewSink | None = None,
         fallback_judge: Judge | None = None,
+        trusted: bool = False,
     ):
         self.judge = judge
+        self.trusted = trusted
         self.schema = judge.schema
         self.fields = tuple(f for f in fields if f != LABEL_FIELD)
         if not self.fields:
@@ -155,8 +153,15 @@ class JudgeLayer(Layer):
         review: ReviewSink | None = None,
         fallback_judge: Judge | None = None,
         fields: Iterable[str] | None = None,
+        calibration: CalibrationResult | None = None,
+        judge_name: str | None = None,
     ) -> JudgeLayer:
-        """L5 for a compiled spec. The review sink is used only when hitl.review_flagged."""
+        """L5 for a compiled spec. The review sink is used only when hitl.review_flagged.
+
+        The judge is trusted when `calibration` passed for this spec_version and judge
+        model (judge_name, default the spec's models.judge); L5 records that in its
+        details so L6 and provenance know whether its confidence counts.
+        """
         from sdgf.tasktypes.registry import REGISTRY
 
         spec = compiled.spec
@@ -169,6 +174,7 @@ class JudgeLayer(Layer):
             escalation=spec.validation.escalation,
             review=review if spec.hitl.review_flagged else None,
             fallback_judge=fallback_judge,
+            trusted=trust_for(compiled, calibration, judge_name),
         )
 
     # ── helpers ──────────────────────────────────────────────────
@@ -229,6 +235,7 @@ class JudgeLayer(Layer):
             "agrees": agrees,
             "low_confidence": low,
             "escalate": self._escalate(record, context, low),
+            "trusted": self.trusted,
         }
         if reason is not None:
             details["reason"] = reason

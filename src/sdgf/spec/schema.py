@@ -277,6 +277,19 @@ class EscalationRules(_Section):
     on_contestable: bool = True
 
 
+class CalibrationRules(_Section):
+    """When a judge counts as calibrated (judge/calibration.py), beside thresholds.kappa_min.
+
+    ece_max bounds the expected calibration error of the verdict confidence, since a
+    trusted judge's confidence replaces K votes (§7.3). min_gold is the smallest gold set
+    a result may pass on (§16 Q4 leaves the right size open per task).
+    """
+
+    ece_max: float = Field(default=0.10, ge=0.0, le=1.0)
+    bins: int = Field(default=10, ge=1, le=100)
+    min_gold: int = Field(default=30, ge=1)
+
+
 class KeywordRule(_Section):
     """An L2 required/forbidden keyword rule over record text.
 
@@ -315,6 +328,7 @@ class ValidationSection(_Section):
     repair_tries: int = Field(default=2, ge=0)
     consistency_k: int = Field(default=5, ge=1)
     escalation: EscalationRules = Field(default_factory=EscalationRules)
+    calibration: CalibrationRules = Field(default_factory=CalibrationRules)
     rules: list[KeywordRule] = Field(default_factory=list)
 
     @field_validator("rules")

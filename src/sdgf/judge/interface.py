@@ -256,6 +256,17 @@ class JudgeResult:
         return d
 
 
+def verdict_means(labels: Mapping[str, Any], verdict: str, label: Any) -> bool:
+    """Whether a judge verdict means the intended label under rubric.verdict.labels."""
+    if verdict not in labels:
+        return False
+    meant = labels[verdict]
+    # True == 1 in Python; a bool label only agrees with a bool, and vice versa.
+    if isinstance(meant, bool) or isinstance(label, bool):
+        return type(meant) is type(label) and meant == label
+    return meant == label
+
+
 class Judge(ABC):
     """A judge scores one record against the compiled rubric, blind to its label.
 

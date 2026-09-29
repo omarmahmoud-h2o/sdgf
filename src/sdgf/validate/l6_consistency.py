@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
+from sdgf.judge.calibration import CalibrationResult, trust_for
 from sdgf.judge.interface import Judge, JudgeError, JudgeParseError
 from sdgf.judge.llm_judge import judge_view
 from sdgf.models.base import ModelBackend
@@ -147,11 +148,14 @@ class ConsistencyLayer(Layer):
         trusted: bool = False,
         answerer: Answerer | None = None,
         fields: Iterable[str] | None = None,
+        calibration: CalibrationResult | None = None,
+        judge_name: str | None = None,
     ) -> ConsistencyLayer:
         """L6 for a compiled spec, with K from validation.consistency_k.
 
-        `trusted` says the judge's calibration passed for this spec_version (read from
-        judge/calibration.py by the caller). The extractor is the task type's.
+        The judge is trusted when `calibration` (judge/calibration.py) passed for this
+        spec_version and judge model (judge_name, default the spec's models.judge), or
+        when the caller says so with `trusted`. The extractor is the task type's.
         """
         from sdgf.tasktypes.registry import REGISTRY
 
@@ -164,7 +168,7 @@ class ConsistencyLayer(Layer):
             fields=task_type.judge_fields() if fields is None else fields,
             labels=spec.rubric.verdict.labels,
             escalation=spec.validation.escalation,
-            trusted=trusted,
+            trusted=trusted or trust_for(compiled, calibration, judge_name),
             answerer=answerer,
             extractor=task_type.answer_extractor(),
         )

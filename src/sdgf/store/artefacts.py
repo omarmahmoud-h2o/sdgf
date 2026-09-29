@@ -124,6 +124,18 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
                 raise ArtefactError(f"{path}:{lineno}: corrupt record: {e}") from None
 
 
+def _write_artefact(path: Path, spec_version: str, stage: str, data: Any) -> None:
+    payload = {"spec_version": spec_version, "stage": stage, "data": data}
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+
+
+def _read_artefact(path: Path, spec_version: str) -> Any:
+    payload = _read_json(path)
+    if not isinstance(payload, dict) or payload.get("spec_version") != spec_version:
+        raise ArtefactError(f"{path}: artefact belongs to a different spec_version")
+    return payload["data"]
+
+
 class RunDir:
     """One run's directory, plus the spec_version-wide shared area."""
 
@@ -143,16 +155,11 @@ class RunDir:
 
     def write_stage(self, stage: str, data: Any, shared: bool = False) -> Path:
         path = self._stage_path(stage, shared)
-        payload = {"spec_version": self.spec_version, "stage": stage, "data": data}
-        _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        _write_artefact(path, self.spec_version, stage, data)
         return path
 
     def read_stage(self, stage: str, shared: bool = False) -> Any:
-        path = self._stage_path(stage, shared)
-        payload = _read_json(path)
-        if not isinstance(payload, dict) or payload.get("spec_version") != self.spec_version:
-            raise ArtefactError(f"{path}: artefact belongs to a different spec_version")
-        return payload["data"]
+        return _read_artefact(self._stage_path(stage, shared), self.spec_version)
 
     def stage(self, stage: str, compute: Callable[[], Any], shared: bool = False) -> Any:
         """Resume point: return the saved artefact if present, else compute, save and return it."""
@@ -178,6 +185,22 @@ class ArtefactStore:
 
     def _version_dir(self, spec_version: str) -> Path:
         return self.root / _check_name("spec_version", spec_version)
+
+    def _shared_path(self, spec_version: str, stage: str) -> Path:
+        return self._version_dir(spec_version) / "shared" / f"{_check_name('stage', stage)}.json"
+
+    # Shared artefacts outside any run (e.g. a judge calibration), the same files a
+    # RunDir of this spec_version reads with shared=True.
+    def has_shared(self, spec_version: str, stage: str) -> bool:
+        return self._shared_path(spec_version, stage).is_file()
+
+    def write_shared(self, spec_version: str, stage: str, data: Any) -> Path:
+        path = self._shared_path(spec_version, stage)
+        _write_artefact(path, spec_version, stage, data)
+        return path
+
+    def read_shared(self, spec_version: str, stage: str) -> Any:
+        return _read_artefact(self._shared_path(spec_version, stage), spec_version)
 
     def open_run(self, spec_version: str, run_id: str | None = None) -> RunDir:
         """Create a new run, or resume `run_id` if it already exists for this spec_version."""
