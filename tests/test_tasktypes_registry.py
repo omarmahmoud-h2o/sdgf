@@ -159,6 +159,18 @@ def test_output_schema_merges_spec_fields():
     assert "severity" not in tt.base_schema()["properties"]
 
 
+def test_output_schema_nullable_field_allows_null():
+    section = OutputSchemaSection(
+        fields={"severity": FieldSpec(type="string", nullable=True, enum=["low", "high"])}
+    )
+    schema = LabelType().output_schema(section)
+    assert schema["properties"]["severity"] == {
+        "type": ["string", "null"],
+        "enum": ["low", "high", None],
+    }
+    assert "severity" in schema["required"]
+
+
 def test_output_schema_without_fields_is_base():
     tt = LabelType()
     assert tt.output_schema() == tt.base_schema()

@@ -100,9 +100,9 @@ class TaskType(ABC):
 
 
 def _field_schema(spec: FieldSpec) -> dict[str, Any]:
-    out: dict[str, Any] = {"type": spec.type}
+    out: dict[str, Any] = {"type": [spec.type, "null"] if spec.nullable else spec.type}
     if spec.description:
         out["description"] = spec.description
     if spec.enum is not None:
-        out["enum"] = list(spec.enum)
+        out["enum"] = list(spec.enum) + ([None] if spec.nullable and None not in spec.enum else [])
     return out

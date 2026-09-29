@@ -63,6 +63,7 @@ class TaskSection(_Section):
 class FieldSpec(_Section):
     type: Literal["string", "integer", "number", "boolean", "array", "object", "null"]
     required: bool = True
+    nullable: bool = False  # the key must be present but may hold null (e.g. FAG severity)
     description: str = ""
     enum: list[Any] | None = None
 
