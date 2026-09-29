@@ -10,6 +10,11 @@ Everything static comes first so vLLM prefix caching and Anthropic prompt cachin
 reuse it across the whole run. prefix_hash identifies the static part: two cells of the
 same compiled spec share it, and any spec, rubric or seed change alters it.
 
+A task type with an answer suffix (sft_qa) gets a response-format section in the prefix,
+so the response ends in a form the answer extractor reads. A cell value on a Bloom axis
+is followed in the cell section by that level's instruction (coverage/axes.py), as
+DS²-Instruct put the query type's description into its generation prompt.
+
 Few-shot seeds are picked once per spec (not per cell) so they stay in the prefix. When
 seeds carry a `label`, the pick interleaves label values so the examples aren't all one
 class (FAG's seed file lists its three breaches first).
@@ -23,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from sdgf.generate.scheduler import Cell
+from sdgf.coverage.axes import bloom_description
 from sdgf.spec.compile import CompiledSpec
 from sdgf.spec.schema import RubricSection, TurnStructure
 from sdgf.store.provenance import prompt_hash
@@ -128,6 +134,12 @@ def build_static_prefix(
     structure = _structure_section(spec.output_schema.turns, spec.output_schema.spans)
     if structure:
         parts.append(structure)
+    suffix = task_type.answer_suffix()
+    if suffix:
+        parts.append(
+            "## Response format\n"
+            "Write the response as a solver would answer the question, following:\n" + suffix
+        )
     if few_shot:
         examples = "\n".join(_dumps(_strip_private(s)) for s in few_shot)
         parts.append(f"## Examples\n{examples}")
@@ -147,9 +159,16 @@ def build_static_prefix(
     return "\n\n".join(parts)
 
 
-def build_cell_section(params: Mapping[str, Any]) -> str:
+def build_cell_section(params: Mapping[str, Any], bloom_axes: Sequence[str] = ()) -> str:
     lines = [CELL_HEADER]
     lines += [f"- {key}: {_dumps(value)}" for key, value in params.items()]
+    guidance = [
+        f"- {key} {params[key]}: {bloom_description(params[key])}"
+        for key in bloom_axes
+        if key in params
+    ]
+    if guidance:
+        lines += ["", "Guidance for these parameters:", *guidance]
     return "\n".join(lines)
 
 
@@ -166,7 +185,9 @@ class PromptBuilder:
         self.task_type = task_type or REGISTRY.resolve(compiled.spec.task)
         self.static_prefix = build_static_prefix(compiled, self.task_type, few_shot)
         self.prefix_hash = _hash_prefix(self.static_prefix)
+        self.bloom_axes = tuple(a.name for a in compiled.spec.coverage.axes if a.source == "bloom")
 
     def build(self, cell: Cell | Mapping[str, Any]) -> Prompt:
         params = cell.params if isinstance(cell, Cell) else cell
-        return Prompt(self.static_prefix, build_cell_section(params), self.prefix_hash)
+        section = build_cell_section(params, self.bloom_axes)
+        return Prompt(self.static_prefix, section, self.prefix_hash)

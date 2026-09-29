@@ -1,0 +1,180 @@
+# CFA exam-style question answering — the answer-emergent use case (FRAMEWORK_DESIGN.md
+# §11, §13), ported from DS²-Instruct's cfa task (src_original/DS2-Instruct/scripts).
+#
+# Nothing is fixed by code but the coverage cell (a keyword and a Bloom level): the model
+# writes the question, its reasoning and its answer. L5 has a blind judge answer the
+# question afresh, and L6 has K fresh answers vote on every record (escalation.always,
+# DS²-Instruct self-consistency); a record is accepted only when its answer is the
+# majority's, so the majority becomes the answer.
+#
+# Ported: the task description (prompts.TASK_DESCRIPTIONS["cfa"]), the multiple-choice
+# response suffix and extractor (answer_format multiple_choice), the domain's keyword
+# examples, and its core keywords (config.TASK_CONFIGS["cfa"]), which DS²-Instruct used
+# only as a silent fallback (§12.1) and are declared seed keywords here. No hooks.py:
+# there is no label rule or sampler conditioning in an answer-emergent task.
+
+task:
+  name: cfa
+  version: "1.0"
+  type: sft_qa
+  generation_mode: answer_emergent
+  answer_format: multiple_choice
+  description: >-
+    Your task is to answer CFA exam questions in a multi-choice form. Select the
+    correct answer choice (e.g., A, B, C). These questions cover asset valuation,
+    investment tools, portfolio management, wealth planning, and ethical and
+    professional standards. They require fundamental knowledge understanding,
+    quantitative analysis, and application skills. Write one self-contained
+    multiple-choice question about the given keyword at the given Bloom level, with
+    three or four options on their own lines as A) B) C) D), exactly one of them
+    correct. Any company or person named is fictional.
+
+output_schema:
+  # On top of sft_qa's question / response / answer. Both come from the coverage cell.
+  fields:
+    keyword:
+      type: string
+      description: The concept the question is about, from keyword expansion.
+    bloom_level:
+      type: string
+      enum: [Remember, Understand, Apply, Analyze, Evaluate, Create]
+      description: The cognitive level the question targets.
+
+rubric:
+  verdict:
+    values: [A, B, C, D]
+    description: >-
+      The letter of the correct option. Answer the question yourself; you are not shown
+      any proposed answer.
+  criteria:
+    - name: question_quality
+      description: Self-contained, unambiguous, exactly one defensible option, at exam level.
+      min: 1
+      max: 5
+  reason_required: never
+
+seeds:
+  path: seeds.jsonl
+  format: few_shot
+  uses: [few_shot, keyword_seeding]
+  few_shot_count: 3
+
+coverage:
+  target_size: 1200
+  quota_policy: even
+  axes:
+    - name: keyword
+      source: keyword_expansion
+    - name: bloom_level
+      source: bloom
+  # Even coverage of the six cognitive levels; keywords are split evenly within each.
+  balance:
+    bloom_level:
+      Remember: 0.16666666666666666
+      Understand: 0.16666666666666666
+      Apply: 0.16666666666666666
+      Analyze: 0.16666666666666666
+      Evaluate: 0.16666666666666666
+      Create: 0.16666666666666670
+  params:
+    keyword_expansion:
+      initial_count: 10
+      iterations: 2
+      per_iteration: 5
+      sample_size: 10
+      max_keywords: 40
+      seed_keywords:
+        - portfolio_theory
+        - risk_management
+        - asset_valuation
+        - derivatives
+        - bonds
+        - equity_analysis
+        - financial_ratios
+        - capm
+        - wacc
+      example_multiword: portfolio_management, risk_assessment
+      example_single: bonds, equity, capm
+
+models:
+  # A local vLLM server by default, as DS²-Instruct ran. Tests replace every stage with
+  # MockBackend via registry overrides and never call a real model. The judge stage also
+  # gives L6's K answers. Local models are priced at 0 per million tokens.
+  expansion:
+    backend: openai_compat
+    model: Qwen2.5-72B-Instruct
+    hosting: local
+    temperature: 0.7
+    max_tokens: 2048
+    input_cost_per_mtok: 0.0
+    output_cost_per_mtok: 0.0
+    params:
+      api_base: http://localhost:8001/v1
+      api_key_env: VLLM_API_KEY
+      top_p: 0.7
+      stop: ["<|im_end|>", "<|endoftext|>"]
+      timeout: 120
+  generator:
+    backend: openai_compat
+    model: Qwen2.5-72B-Instruct
+    hosting: local
+    temperature: 0.7
+    max_tokens: 2048
+    input_cost_per_mtok: 0.0
+    output_cost_per_mtok: 0.0
+    params:
+      api_base: http://localhost:8001/v1
+      api_key_env: VLLM_API_KEY
+      top_p: 0.7
+      stop: ["<|im_end|>", "<|endoftext|>"]
+      timeout: 120
+  judge:
+    backend: openai_compat
+    model: Qwen2.5-72B-Instruct
+    hosting: local
+    temperature: 0.0
+    max_tokens: 512
+    input_cost_per_mtok: 0.0
+    output_cost_per_mtok: 0.0
+    params:
+      api_base: http://localhost:8001/v1
+      api_key_env: VLLM_API_KEY
+      timeout: 120
+
+validation:
+  layers: [L1, L2, L3, L4, L5, L6]
+  repair_tries: 2
+  # K fresh answers per question; a majority of the readable ones becomes the answer.
+  consistency_k: 5
+  escalation:
+    low_confidence: 0.7
+    on_hard_cells: false
+    on_contestable: false
+    always: true
+  calibration:
+    ece_max: 0.10
+    bins: 10
+    min_gold: 30
+
+# Starting points from FRAMEWORK_DESIGN.md §8, to revisit once real runs exist.
+# balance_tolerance gates the Bloom-level shares.
+thresholds:
+  fidelity_min: 0.90
+  kappa_min: 0.70
+  coverage_min_cell_fill: 0.90
+  balance_tolerance: 0.05
+  distinct_n_min: 0.30
+  self_bleu_max: 0.60
+  semantic_diversity_min: 1.0
+  residual_error_max: 0.05
+  governance_violations_max: 0
+  overlap_max: 0.80
+  cost_per_record_max: 0.05
+
+hitl:
+  approve_coverage_plan: false
+  review_flagged: false
+  calibrate_judge: false
+
+budget:
+  max_candidates: 4000

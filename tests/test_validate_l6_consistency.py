@@ -357,3 +357,58 @@ def test_fag_contestable_seed_fails_when_votes_disagree(fag, seeds):
     )
     result = Cascade([l5, trusted]).run(seed, ValidationContext(recipe=seed))
     assert result.passed and result.verdicts[-1].details["method"] == "confidence"
+
+
+# ── answer_emergent: the majority is the record's answer ─────────
+
+
+def test_answer_emergent_record_answer_differing_from_the_majority_is_repairable():
+    lay = answer_layer(["B", "B", "B", "C", "A"], answer_field="answer")
+    record = {"question": "Q?", "response": "Answer: C", "answer": "C"}
+    v = lay.check(record, ctx(l5_verdict()))
+    assert v.repairable and v.codes == ("consistency_answer_mismatch",)
+    assert v.errors[0].path == "answer"
+    assert v.errors[0].details == {"agree": 3, "cast": 5, "majority": "B", "answer": "C"}
+    assert v.details["majority"] == "B"
+
+
+def test_answer_emergent_record_answer_matching_the_majority_passes():
+    lay = answer_layer(["B", "B", "B", "C", "A"], answer_field="answer")
+    record = {"question": "Q?", "response": "Answer: B", "answer": "B"}
+    v = lay.check(record, ctx(l5_verdict()))
+    assert v.passed and v.details["answer"] == "B"
+
+
+def test_answer_field_is_hidden_from_the_voters():
+    seen = []
+    lay = ConsistencyLayer(
+        mode="answer_emergent",
+        k=1,
+        fields=("question", "answer"),
+        answerer=lambda view, i: seen.append(view) or "B",
+        extractor=letter,
+        answer_field="answer",
+    )
+    lay.check({"question": "Q?", "answer": "B"}, ctx(l5_verdict()))
+    assert seen == [{"question": "Q?"}]
+
+
+def test_from_spec_checks_the_task_types_answer_under_answer_emergent():
+    cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
+    lay = ConsistencyLayer.from_spec(cfa, answerer=lambda view, i: "Answer: A")
+    assert (lay.mode, lay.answer_field, lay.fields, lay.k) == (
+        "answer_emergent",
+        "answer",
+        ("question",),
+        5,
+    )
+    # escalation.always: voted with no L5 verdict and no hard or contestable facts
+    record = {"question": "Q?\nA) x\nB) y", "response": "Answer: B", "answer": "B"}
+    v = lay.check(record, ValidationContext(cell_id="c1", recipe={}))
+    assert v.repairable and v.codes == ("consistency_answer_mismatch",)
+
+
+def test_label_first_from_spec_checks_no_answer_field():
+    fag = compile_spec(FAG_DIR)
+    judge = LLMJudge.from_spec(fag, MockBackend(["{}"], cycle=True))
+    assert ConsistencyLayer.from_spec(fag, judge=judge).answer_field is None

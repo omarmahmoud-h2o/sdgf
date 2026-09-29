@@ -18,6 +18,10 @@ repaired nor accepted here); the review queue resolves it. A judge that can't pr
 schema-valid answer is dropped rather than repaired, since regenerating the record
 doesn't fix the judge; the drop log counts it so a broken judge shows up in metrics.
 
+Under answer_emergent there is no fixed label: the intended label is the answer the
+model gave (the task type's label_field, sft_qa's `answer`), and the judge, shown only
+the question, answers it afresh. Fidelity is then the judge reaching the same answer.
+
 Every verdict carries details for L6 and provenance: the judge result, agreement,
 low_confidence, escalate (low confidence, a hard cell or a contestable record, per
 validation.escalation) and trusted (the judge's calibration passed, judge/calibration.py). When the rubric requires a reason (always, or flagged and the
@@ -52,14 +56,20 @@ HARD_DIFFICULTY = "hard"
 def escalates(
     rules: EscalationRules, record: Record, context: ValidationContext, low: bool
 ) -> bool:
-    """Low confidence, a hard cell or a contestable record, per validation.escalation."""
+    """Low confidence, a hard cell or a contestable record, or always, per
+    validation.escalation."""
 
     def fact(name: str) -> Any:
         return context.recipe.get(name, record.get(name))
 
     hard = str(fact("difficulty") or "").casefold() == HARD_DIFFICULTY
     contestable = fact("contestable") is True
-    return low or (rules.on_hard_cells and hard) or (rules.on_contestable and contestable)
+    return (
+        rules.always
+        or low
+        or (rules.on_hard_cells and hard)
+        or (rules.on_contestable and contestable)
+    )
 
 
 @dataclass(frozen=True)
@@ -119,11 +129,15 @@ class JudgeLayer(Layer):
         review: ReviewSink | None = None,
         fallback_judge: Judge | None = None,
         trusted: bool = False,
+        label_field: str = LABEL_FIELD,
+        answer_emergent: bool = False,
     ):
         self.judge = judge
         self.trusted = trusted
         self.schema = judge.schema
-        self.fields = tuple(f for f in fields if f != LABEL_FIELD)
+        self.label_field = label_field
+        self.answer_emergent = answer_emergent
+        self.fields = tuple(f for f in fields if f != label_field)
         if not self.fields:
             raise JudgeError("L5 needs at least one record field the judge may see")
         values = self.schema.verdict_values
@@ -165,8 +179,9 @@ class JudgeLayer(Layer):
         from sdgf.tasktypes.registry import REGISTRY
 
         spec = compiled.spec
+        task_type = REGISTRY.resolve(spec.task)
         if fields is None:
-            fields = REGISTRY.resolve(spec.task).judge_fields()
+            fields = task_type.judge_fields()
         return cls(
             judge,
             fields=fields,
@@ -175,6 +190,8 @@ class JudgeLayer(Layer):
             review=review if spec.hitl.review_flagged else None,
             fallback_judge=fallback_judge,
             trusted=trust_for(compiled, calibration, judge_name),
+            label_field=task_type.label_field(),
+            answer_emergent=spec.task.generation_mode == "answer_emergent",
         )
 
     # ── helpers ──────────────────────────────────────────────────
@@ -220,7 +237,7 @@ class JudgeLayer(Layer):
     # ── check ────────────────────────────────────────────────────
 
     def check(self, record: Record, context: ValidationContext) -> LayerVerdict:
-        label = context.recipe.get(LABEL_FIELD, record.get(LABEL_FIELD))
+        label = context.recipe.get(self.label_field, record.get(self.label_field))
         view = judge_view(record, self.fields)
         try:
             result = self.judge.judge(view)
@@ -254,11 +271,19 @@ class JudgeLayer(Layer):
 
         if not agrees:
             expected = self.verdicts_for(label)
-            message = (
-                f"an independent judge read this record as {result.verdict!r}, but the "
-                f"fixed label calls for {' or '.join(map(repr, expected)) or 'another verdict'}; "
-                "rewrite the content so it clearly matches the fixed label"
-            )
+            if self.answer_emergent:
+                message = (
+                    f"an independent judge answered the question {result.verdict!r}, but "
+                    f"the record's {self.label_field} is {label!r}; make the question "
+                    "unambiguous and the response reach its correct answer"
+                )
+            else:
+                message = (
+                    f"an independent judge read this record as {result.verdict!r}, but the "
+                    f"fixed label calls for "
+                    f"{' or '.join(map(repr, expected)) or 'another verdict'}; "
+                    "rewrite the content so it clearly matches the fixed label"
+                )
             if reason:
                 message += f". Judge's reason: {reason}"
             issue = ValidationIssue(

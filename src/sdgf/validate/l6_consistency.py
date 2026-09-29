@@ -11,6 +11,13 @@ Every other record passes untouched, so the paid K votes are spent only where ne
     answer_emergent                                         K answers; the majority
                                                             becomes the answer
 
+Under answer_emergent the record already carries the generator's answer (answer_field,
+from the task type's label_field). The majority *becomes* the answer by agreement: a
+record whose answer differs from the majority is sent back for repair
+(consistency_answer_mismatch), so every accepted record's answer is the majority's.
+The winning voter's response is kept only in the details, not written into the record,
+since the cheaper layers (governance, overlap) never checked that text.
+
 A judge is trusted only once its calibration passed (judge/calibration.py); until then
 its confidence isn't evidence and K votes are taken. answer_emergent always votes, since
 there the votes produce the answer rather than check it.
@@ -104,17 +111,19 @@ class ConsistencyLayer(Layer):
         answerer: Answerer | None = None,
         extractor: AnswerExtractor | None = None,
         escalated_only: bool = True,
+        answer_field: str | None = None,
     ):
         if k < 1:
             raise ConsistencyError("consistency needs k >= 1")
         self.mode = mode
         self.k = k
-        self.fields = tuple(f for f in fields if f != LABEL_FIELD)
+        self.fields = tuple(f for f in fields if f not in (LABEL_FIELD, answer_field))
         if not self.fields:
             raise ConsistencyError("L6 needs at least one record field the voters may see")
         self.escalation = escalation or EscalationRules()
         self.trusted = trusted
         self.escalated_only = escalated_only
+        self.answer_field = answer_field
         self.judge = judge
         self.answerer = answerer
         self.extractor = extractor
@@ -161,6 +170,7 @@ class ConsistencyLayer(Layer):
 
         spec = compiled.spec
         task_type = REGISTRY.resolve(spec.task)
+        emergent = spec.task.generation_mode == "answer_emergent"
         return cls(
             mode=spec.task.generation_mode,
             k=spec.validation.consistency_k,
@@ -171,6 +181,7 @@ class ConsistencyLayer(Layer):
             trusted=trusted or trust_for(compiled, calibration, judge_name),
             answerer=answerer,
             extractor=task_type.answer_extractor(),
+            answer_field=task_type.label_field() if emergent else None,
         )
 
     # ── check ────────────────────────────────────────────────────
@@ -186,7 +197,7 @@ class ConsistencyLayer(Layer):
             return LayerVerdict(self.name, "pass", (), {"escalated": False, "method": "skipped"})
         view = judge_view(record, self.fields)
         if self.mode == "answer_emergent":
-            return self._answer_votes(view)
+            return self._answer_votes(record, view)
         if self.trusted:
             verdict = self._by_confidence(context)
             if verdict is not None:
@@ -239,7 +250,7 @@ class ConsistencyLayer(Layer):
         )
         return LayerVerdict(self.name, "fail_repairable", (issue,), details)
 
-    def _answer_votes(self, view: Record) -> LayerVerdict:
+    def _answer_votes(self, record: Record, view: Record) -> LayerVerdict:
         responses = [self.answerer(view, i) for i in range(self.k)]
         answers = [None if r is None else self.extractor(r) for r in responses]
         top, count, cast = majority(answers)
@@ -258,7 +269,18 @@ class ConsistencyLayer(Layer):
         if 2 * count > cast:
             details["answer"] = top
             details["response"] = next(r for r, a in zip(responses, answers) if a == top)
-            return LayerVerdict(self.name, "pass", (), details)
+            own = record.get(self.answer_field) if self.answer_field else None
+            if own is None or own == top:
+                return LayerVerdict(self.name, "pass", (), details)
+            issue = ValidationIssue(
+                "consistency_answer_mismatch",
+                f"{count} of {cast} independent answers to the question are {top!r}, but "
+                f"the record's {self.answer_field} is {own!r}; correct the response so it "
+                "reaches the right answer, or make the question unambiguous",
+                path=self.answer_field,
+                details={"agree": count, "cast": cast, "majority": top, "answer": own},
+            )
+            return LayerVerdict(self.name, "fail_repairable", (issue,), details)
         issue = ValidationIssue(
             "consistency_no_majority",
             f"no answer won a majority of the {cast} readable votes (most common "

@@ -68,6 +68,10 @@ the run cleanly between waves, overshooting by at most what that estimate missed
 from what was accepted, with the budget applying afresh to that invocation, while
 usage.json keeps the run's total. Release rounds within one invocation share a budget.
 
+Under answer_emergent, L6's K answers come from the judge stage's backend unless an
+answerer is passed: a BackendAnswerer shown only the question plus the task type's answer
+suffix, so the votes are independent of the generator and no new endpoint gets data.
+
 L5 (judge) and L6 (consistency) build the judge stage, and the fallback judge only when
 the rubric may ask for reasons, so the D12 endpoint record names only models that get
 data. The judge counts as trusted when a calibration result for this spec_version and
@@ -122,7 +126,7 @@ from sdgf.validate.l2_rules import RulesLayer
 from sdgf.validate.l3_governance import GovernanceLayer
 from sdgf.validate.l4_overlap import OverlapLayer
 from sdgf.validate.l5_judge import JudgeLayer, ReviewItem, ReviewSink
-from sdgf.validate.l6_consistency import Answerer, ConsistencyLayer
+from sdgf.validate.l6_consistency import Answerer, BackendAnswerer, ConsistencyLayer
 from sdgf.validate.repair import GENERATE_STAGE, Drop, DropLog, RepairLoop
 
 log = logging.getLogger(__name__)
@@ -457,12 +461,30 @@ class Pipeline:
             "L6": lambda: ConsistencyLayer.from_spec(
                 self.compiled,
                 judge=self.judge,
-                answerer=answerer,
+                answerer=answerer if answerer is not None else self._answerer(),
                 calibration=calibration,
                 judge_name=judge_name,
             ),
         }
         return {name: build[name]() for name in self.layers}
+
+    def _answerer(self) -> Answerer | None:
+        """The default L6 answerer for answer_emergent: K fresh answers from the judge stage."""
+        if self.compiled.spec.task.generation_mode != "answer_emergent":
+            return None
+        fields = self.task_type.judge_fields()
+        if len(fields) != 1:
+            raise PipelineError(
+                f"the default L6 answerer answers one question field, but task type "
+                f"{self.task_type.name!r} shows the judge {list(fields)}; pass an answerer"
+            )
+        cfg = self.compiled.spec.models.judge
+        return BackendAnswerer(
+            self._bounded["judge"],
+            question_field=fields[0],
+            suffix=self.task_type.answer_suffix(),
+            max_tokens=cfg.max_tokens if cfg is not None else 1024,
+        )
 
     def _intake_summary(self) -> dict[str, Any]:
         spec = self.compiled.spec

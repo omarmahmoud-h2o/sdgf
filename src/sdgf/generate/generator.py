@@ -11,7 +11,8 @@ The recipe is code-owned. merge() lays every recipe field over the model's outpu
 under label_first the label and every context fact come from the cell, never from the
 model; the model contributes only the fields the recipe doesn't fix (the prose, the
 messages and the spans). Keys starting with "_" are pipeline-private and are dropped
-from model output.
+from model output. The task type then fills fields readable from the model's own
+output (derive_fields; sft_qa reads a missing answer out of the response).
 
 The agent loop (§6.3, D4): when the task lists tools, the generator is given a
 ToolGateway and the backend is offered the task's tool specs. A reply with tool calls is
@@ -253,7 +254,7 @@ class Generator:
                 recipe,
                 prompt,
                 response,
-                record=merge(recipe, parsed),
+                record=self.prompts.task_type.derive_fields(merge(recipe, parsed)),
                 tool_results=tuple(results),
                 tool_rounds=rounds,
                 calls=calls,

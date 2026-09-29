@@ -12,6 +12,11 @@ A task type is the *kind* of dataset. It supplies what every task of that kind s
     configure(task)      the instance for a spec, for types with options (answer_format)
     judge_fields         the record fields a judge may see; never the label or any
                          field that encodes it, since L5 judges blind (§6.4)
+    label_field          the field L5 fidelity compares the verdict with: the fixed label
+                         (label_first) or the answer the model gave (answer_emergent)
+    answer_suffix        the answer form a response must end in, for extractable answers
+    derive_fields        fills fields readable from the model's output (e.g. the answer
+                         from the response) before validation
 
 The spec's output_schema.fields are layered on top by output_schema(); a spec field may
 not redefine a field the type owns.
@@ -61,7 +66,16 @@ class TaskType(ABC):
 
     def judge_fields(self) -> tuple[str, ...]:
         """Fields a blind judge sees: every type-owned field except the label."""
-        return tuple(k for k in self.base_schema()["properties"] if k != "label")
+        return tuple(k for k in self.base_schema()["properties"] if k != self.label_field())
+
+    def label_field(self) -> str:
+        return "label"
+
+    def answer_suffix(self) -> str:
+        return ""
+
+    def derive_fields(self, record: Record) -> Record:
+        return record
 
     def check_definition(self) -> None:
         """Raise TaskTypeError if the type itself is inconsistent; run at registration."""

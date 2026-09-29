@@ -115,3 +115,29 @@ def test_no_few_shot_when_seeds_not_used_for_it(fag):
     b = PromptBuilder(type(fag)(spec, fag.hooks, fag.seeds, fag.spec_version, fag.task_dir))
     assert "## Examples" not in b.static_prefix
     assert "SEED-FAG-" not in b.static_prefix
+
+
+# ── answer_emergent (CFA) ────────────────────────────────────────
+
+
+def test_bloom_axis_values_get_their_instruction_in_the_cell_section():
+    from sdgf.coverage.axes import BLOOM_LEVELS
+
+    cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
+    b = PromptBuilder(cfa)
+    prompt = b.build({"keyword": "bonds", "bloom_level": "Evaluate"})
+    assert f"- bloom_level Evaluate: {BLOOM_LEVELS['Evaluate']}" in prompt.cell
+    assert BLOOM_LEVELS["Evaluate"] not in prompt.static
+    # the parameter lines still come first, one per line, as before
+    assert prompt.cell.split("\n")[1:3] == ['- keyword: "bonds"', '- bloom_level: "Evaluate"']
+    assert b.build({"keyword": "capm", "bloom_level": "Apply"}).prefix_hash == prompt.prefix_hash
+
+
+def test_answer_suffix_goes_into_the_static_prefix_only_for_types_with_one(fag, builder):
+    from sdgf.tasktypes.sft_qa import MULTIPLE_CHOICE
+
+    cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
+    static = PromptBuilder(cfa).static_prefix
+    assert "## Response format" in static and MULTIPLE_CHOICE.suffix in static
+    assert "## Response format" not in builder.static_prefix
+    assert "Guidance for these parameters" not in builder.build({"label": True}).cell

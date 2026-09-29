@@ -331,3 +331,47 @@ def test_fag_spec_rejects_label_map_typo(fag):
     data["rubric"]["verdict"]["labels"] = {"breech": True}
     with pytest.raises(SpecValidationError, match="rubric.verdict"):
         parse_spec(data)
+
+
+# ── answer_emergent ──────────────────────────────────────────────
+
+
+def emergent_layer(verdict):
+    judge = FakeJudge(verdict)
+    return judge, layer(judge, fields=("question",), label_field="answer", answer_emergent=True)
+
+
+def test_answer_emergent_fidelity_compares_the_judges_answer_with_the_records():
+    judge, lay = emergent_layer("yes")
+    record = {"question": "Q?", "response": "Answer: yes", "answer": "yes"}
+    v = lay.check(record, ValidationContext(cell_id="c1", recipe={"keyword": "k"}))
+    assert v.passed and v.details["agrees"]
+    assert judge.seen == [{"question": "Q?"}]
+
+
+def test_answer_emergent_disagreement_names_the_records_answer_not_a_fixed_label():
+    _, lay = emergent_layer("no")
+    record = {"question": "Q?", "response": "Answer: yes", "answer": "yes"}
+    v = lay.check(record, ValidationContext(cell_id="c1", recipe={}))
+    assert v.repairable and v.codes == ("judge_disagrees",)
+    message = v.errors[0].message
+    assert "answered the question 'no'" in message and "answer is 'yes'" in message
+    assert "fixed label" not in message
+
+
+def test_from_spec_takes_the_label_field_from_the_task_type():
+    cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
+    lay = JudgeLayer.from_spec(cfa, FakeJudge())
+    assert (lay.label_field, lay.answer_emergent, lay.fields) == ("answer", True, ("question",))
+    fag = compile_spec(FAG_DIR)
+    fag_judge = LLMJudge.from_spec(fag, MockBackend(["{}"], cycle=True))
+    fag_layer = JudgeLayer.from_spec(fag, fag_judge)
+    assert (fag_layer.label_field, fag_layer.answer_emergent) == ("label", False)
+
+
+def test_escalation_always_escalates_every_record():
+    _, lay = emergent_layer("yes")
+    lay.escalation = EscalationRules(always=True, on_hard_cells=False, on_contestable=False)
+    record = {"question": "Q?", "response": "Answer: yes", "answer": "yes"}
+    v = lay.check(record, ValidationContext(cell_id="c1", recipe={}))
+    assert v.passed and v.details["escalate"] and not v.details["low_confidence"]

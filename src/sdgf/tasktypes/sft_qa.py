@@ -183,6 +183,19 @@ class SftQA(TaskType):
     def answer_suffix(self) -> str:
         return self.format.suffix
 
+    def label_field(self) -> str:
+        # L5 compares a blind judge's answer with the model's own answer.
+        return "answer"
+
+    def derive_fields(self, record: Record) -> Record:
+        """Fill a missing answer from the response, so L5 and L6 have one to compare."""
+        response = _text(record, "response")
+        if record.get("answer") is None and response is not None:
+            extracted = self.format.extractor(response)
+            if extracted is not None:
+                return {**record, "answer": extracted}
+        return record
+
     def default_validators(self) -> list[Validator]:
         validators = [self.response_answer_errors]
         if self.format is MULTIPLE_CHOICE:

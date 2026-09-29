@@ -296,6 +296,8 @@ class EscalationRules(_Section):
     low_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     on_hard_cells: bool = True
     on_contestable: bool = True
+    # Escalate every record to L6, e.g. DS²-Instruct self-consistency on every question.
+    always: bool = False
 
 
 class CalibrationRules(_Section):

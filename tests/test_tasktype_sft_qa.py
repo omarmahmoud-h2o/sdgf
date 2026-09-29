@@ -213,3 +213,35 @@ def test_option_labels_forms():
 def test_option_check_only_for_multiple_choice():
     record = {"question": "What is 2 + 3?", "response": "final answer: 5"}
     assert _errors(SftQA("numeric"), record) == []
+
+
+# ── label field and derived answer ───────────────────────────────
+
+
+def test_label_field_is_the_answer_and_the_judge_never_sees_it():
+    sft = SftQA()
+    assert sft.label_field() == "answer"
+    assert sft.answer_suffix() == sft.format.suffix
+    assert "answer" not in sft.judge_fields() and "response" not in sft.judge_fields()
+
+
+def test_derive_fields_reads_a_missing_answer_from_the_response():
+    sft = SftQA()
+    record = {k: v for k, v in RECORD.items() if k != "answer"}
+    assert sft.derive_fields(record) == {**record, "answer": "B"}
+    assert "answer" not in record  # the input isn't modified
+
+
+def test_derive_fields_keeps_a_given_answer_and_unreadable_responses():
+    sft = SftQA()
+    wrong = {**RECORD, "answer": "C"}
+    assert sft.derive_fields(wrong) == wrong  # left for the validator to reject
+    unreadable = {"question": QUESTION, "response": "no idea"}
+    assert sft.derive_fields(unreadable) == unreadable
+
+
+def test_other_task_types_keep_the_label_field_and_derive_nothing():
+    spans = get_task_type("classification_spans")
+    assert spans.label_field() == "label" and spans.answer_suffix() == ""
+    record = {"label": True}
+    assert spans.derive_fields(record) is record

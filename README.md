@@ -7,7 +7,11 @@ The framework handles coverage planning, generation, the six-layer validation ca
 evaluation, the release gate and provenance. The design is in
 [../FRAMEWORK_DESIGN.md](../FRAMEWORK_DESIGN.md); section numbers (§) below refer to it.
 
-The first use case is the Financial Advice Guardrail (FAG), in [tasks/fag/](tasks/fag/).
+The first use case is the Financial Advice Guardrail (FAG), in [tasks/fag/](tasks/fag/),
+a `label_first` task: code fixes the label and the model writes matching text. The second,
+in [tasks/cfa/](tasks/cfa/), is DS²-Instruct's CFA exam questions, an `answer_emergent`
+task: the model writes the question and its answer, a blind judge and K fresh answers
+check it, and a record is kept only when its answer is the majority's.
 
 ## Install
 
@@ -201,8 +205,10 @@ go in the spec.
 - `repair_tries` (default 2): the number of re-prompts with the validator's errors
   before the record is dropped.
 - `consistency_k` (default 5): the number of L6 votes.
-- `escalation`: `low_confidence` (default 0.7), `on_hard_cells`, `on_contestable`.
-  Escalated records go to L6.
+- `escalation`: `low_confidence` (default 0.7), `on_hard_cells`, `on_contestable`, and
+  `always` (default false; escalate every record, as CFA does for DS²-Instruct
+  self-consistency). Escalated records go to L6. Under `answer_emergent`, L6's K answers
+  come from the judge stage's model, shown only the question and the answer format.
 - `calibration`: `ece_max`, `bins` and `min_gold`. These, together with
   `thresholds.kappa_min`, decide when the judge's confidence can stand in for K votes.
 - `rules`: L2 keyword rules. Each rule has these keys:
@@ -334,5 +340,6 @@ src/sdgf/
   hitl/        review queue, plan approval
   pipeline.py  cli.py
 tasks/fag/     task.yaml hooks.py seeds.jsonl
+tasks/cfa/     task.yaml seeds.jsonl
 tests/
 ```
