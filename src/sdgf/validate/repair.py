@@ -13,6 +13,11 @@ A generation failure (no parseable JSON, no text) is fed back the same way; its 
 entry has layer "generate". When the tries are exhausted the candidate is dropped with a
 logged reason keyed by cell and layer, which the drop log counts for error-rate metrics.
 The scheduler then requeues the slot in the same cell (scheduler.reject).
+
+When the task has tools, one tool session is opened per slot and shared by every try,
+so the per-record call and token budgets cover repairs too. Its trace so far is handed
+to the cascade as context.extra["tool_trace"] (which L3 reads), and every call is
+appended to the record's provenance.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from sdgf.store.artefacts import JsonlWriter
 from sdgf.store.provenance import ProvenanceBuilder
 from sdgf.validate.base import Record, ValidationContext, ValidationIssue
 from sdgf.validate.cascade import Cascade, CascadeResult
+from sdgf.validate.l3_governance import TOOL_TRACE_KEY
 
 log = logging.getLogger(__name__)
 
@@ -156,11 +162,16 @@ class RepairLoop:
             provenance.set_prompt(prompt.text)
         outcome = RepairOutcome(cell_id, None, 0)
         feedback = ""
+        session = self.generator.session()
         for attempt in range(self.repair_tries + 1):
             if attempt and provenance is not None:
                 provenance.start_repair()
             outcome.attempts = attempt + 1
-            gen = self.generator.complete(cell_id, recipe, prompt, extra=feedback)
+            traced = len(session.trace) if session is not None else 0
+            gen = self.generator.complete(cell_id, recipe, prompt, extra=feedback, session=session)
+            if session is not None and provenance is not None:
+                for entry in session.trace[traced:]:
+                    provenance.add_tool_call(entry)
             if not gen.ok:
                 issue = _generation_issue(gen)
                 outcome.history.append((GENERATE_STAGE, (issue.code,)))
@@ -169,8 +180,11 @@ class RepairLoop:
                 feedback = repair_feedback([issue])
                 continue
 
+            extra = dict(extra_context or {})
+            if session is not None:
+                extra[TOOL_TRACE_KEY] = session.trace_dicts()
             context = ValidationContext(
-                cell_id=cell_id, recipe=dict(recipe), attempt=attempt, extra=extra_context or {}
+                cell_id=cell_id, recipe=dict(recipe), attempt=attempt, extra=extra
             )
             result = self.cascade.run(gen.record, context, provenance)
             outcome.result = result

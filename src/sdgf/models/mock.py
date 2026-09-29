@@ -4,8 +4,12 @@
     MockBackend(["same reply"], cycle=True)             # repeats the script
     MockBackend(lambda call: f"echo {call.prompt}")     # computed per call
 
-Script entries and callable results may be a str (text only) or a ModelResponse
-(for tool calls or token counts). Every call is recorded in .calls.
+    MockBackend([ToolCall("lookup", {"q": "x"}), "final reply"])  # a tool round, then text
+
+Script entries and callable results may be a str (text only), a ToolCall or a list of
+ToolCalls (one agent round of tool calls, no text), or a ModelResponse (for text with
+tool calls, or token counts). Every call, with the tools it was offered, is recorded
+in .calls.
 """
 
 from __future__ import annotations
@@ -13,10 +17,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Sequence, Union
 
-from sdgf.models.base import ModelBackend, ModelBackendError, ModelResponse, ToolSpec
+from sdgf.models.base import ModelBackend, ModelBackendError, ModelResponse, ToolCall, ToolSpec
 from sdgf.spec.schema import Hosting
 
-Reply = Union[str, ModelResponse]
+Reply = Union[str, ModelResponse, ToolCall, Sequence[ToolCall]]
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,14 @@ class MockBackend(ModelBackend):
             return reply
         if isinstance(reply, str) or reply is None:
             return ModelResponse(text=reply)
+        if isinstance(reply, ToolCall):
+            return ModelResponse(text=None, tool_calls=(reply,))
+        if (
+            isinstance(reply, (list, tuple))
+            and reply
+            and all(isinstance(c, ToolCall) for c in reply)
+        ):
+            return ModelResponse(text=None, tool_calls=tuple(reply))
         raise ModelBackendError(
             f"MockBackend reply must be str or ModelResponse, got {type(reply).__name__}"
         )

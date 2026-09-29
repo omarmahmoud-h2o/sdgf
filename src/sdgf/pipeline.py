@@ -19,6 +19,11 @@ D12 endpoint record, only when an axis needs keywords and no plan is cached yet.
     summary.json   the scheduler snapshot and drop counts at the end of the run
     review.jsonl   records L5 queued for people, when hitl.review_flagged and no sink is given
 
+When the task lists tools, the generator runs as an agent behind one ToolGateway built
+from the tool registry (tools/registry.REGISTRY unless one is passed), with the
+spec_version's shared tool cache (shared/tool_cache.jsonl). Each record's tool trace goes
+to L3 and into its provenance.
+
 Reopening an existing run id resumes it: accepted counts are restored per cell from
 accepted.jsonl, and per-candidate seeds continue from where the run stopped, so a
 resumed run never regenerates a candidate it already tried. The L4 near-duplicate corpus
@@ -61,6 +66,10 @@ from sdgf.store.artefacts import ArtefactStore, JsonlWriter, RunDir
 from sdgf.store.provenance import PROVENANCE_KEY, ProvenanceBuilder, attach
 from sdgf.tasktypes.base import TaskType
 from sdgf.tasktypes.registry import REGISTRY as TASK_TYPES
+from sdgf.tools.cache import ToolCache
+from sdgf.tools.gateway import ToolGateway
+from sdgf.tools.registry import REGISTRY as TOOLS
+from sdgf.tools.registry import ToolRegistry
 from sdgf.validate.base import Layer
 from sdgf.validate.cascade import Cascade
 from sdgf.validate.l1_schema import SchemaLayer
@@ -156,10 +165,16 @@ class Pipeline:
         calibration: CalibrationResult | None = None,
         review: ReviewSink | None = None,
         answerer: Answerer | None = None,
+        tool_registry: ToolRegistry | None = None,
     ):
         # Stage 0: spec schema and hook signatures are checked on load; the task type
         # and its generation mode are resolved here, before any model is built.
-        self.compiled = spec if isinstance(spec, CompiledSpec) else compile_spec(spec)
+        tool_registry = tool_registry if tool_registry is not None else TOOLS
+        self.compiled = (
+            spec
+            if isinstance(spec, CompiledSpec)
+            else compile_spec(spec, tool_registry=tool_registry)
+        )
         self.task_type: TaskType = TASK_TYPES.resolve(self.compiled.spec.task)
         self.store = store if isinstance(store, ArtefactStore) else ArtefactStore(store)
         self.seed = seed
@@ -210,8 +225,18 @@ class Pipeline:
             }
         )
         self.models: StageModels = build_models(spec_models, overrides)
+        # Tools: the task's allowlist behind one gateway, with the spec_version's shared
+        # response cache, so every run of the spec reuses (and can replay) tool results.
+        self.tool_cache: ToolCache | None = None
+        gateway = None
+        if self.compiled.spec.tools:
+            self.tool_cache = ToolCache.for_store(self.store, self.compiled.spec_version)
+            gateway = ToolGateway(tool_registry.for_task(self.compiled.spec), self.tool_cache)
         self.generator = Generator(
-            self.compiled, self.models.backend("generator"), task_type=self.task_type
+            self.compiled,
+            self.models.backend("generator"),
+            task_type=self.task_type,
+            gateway=gateway,
         )
         self.review_sink: RunReviewSink | None = None
         if review is None and self.compiled.spec.hitl.review_flagged and "L5" in self.layers:
@@ -352,6 +377,8 @@ class Pipeline:
 
         accepted: list[dict[str, Any]] = []
         with ExitStack() as streams:
+            if self.tool_cache is not None:
+                streams.callback(self.tool_cache.close)
             out = streams.enter_context(run.jsonl(ACCEPTED_STREAM))
             drops = DropLog(streams.enter_context(run.jsonl(DROPS_STREAM)))
             if self.review_sink is not None:
