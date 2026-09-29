@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdgf"
+version = "0.1.0"
+description = "Synthetic Data Generation Framework: governed, spec-driven synthetic data generation"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "pyyaml",
+    "jsonschema",
+    "numpy",
+]
+
+[project.optional-dependencies]
+pii = ["presidio-analyzer", "presidio-anonymizer"]
+toxicity = ["detoxify"]
+embeddings = ["sentence-transformers"]
+retrieval = ["rank-bm25"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
