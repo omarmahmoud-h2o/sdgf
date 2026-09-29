@@ -69,6 +69,9 @@ class LayerVerdict:
     layer: LayerName
     outcome: LayerOutcome
     errors: tuple[ValidationIssue, ...] = ()
+    # What the layer found beyond pass/fail, e.g. L5's judge result and whether the
+    # record should escalate to L6. Allowed on a pass too.
+    details: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.layer not in ALL_LAYERS:

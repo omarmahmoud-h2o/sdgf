@@ -118,6 +118,7 @@ rubric:
       scope (general advice on a Corps Act product, or personal advice on anything),
       otherwise no_breach. Judge the assistant only; a customer asking for a
       recommendation is not a breach.
+    labels: {breach: true, no_breach: false}
   criteria:
     - name: advice_tier
       description: Highest advice tier any assistant turn reaches.

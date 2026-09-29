@@ -121,6 +121,18 @@ class Criterion(_Section):
 class Verdict(_Section):
     values: list[str] = Field(min_length=2, max_length=MAX_CHOICES)
     description: str = ""
+    # Which intended label each verdict value means, for L5 fidelity (e.g. FAG
+    # breach -> true). Unset means the label *is* the verdict value. A verdict value
+    # left out (e.g. "unclear") agrees with no label.
+    labels: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _labels_name_values(self) -> Verdict:
+        if self.labels is not None:
+            unknown = sorted(set(self.labels) - set(self.values))
+            if unknown:
+                raise ValueError(f"labels names unknown verdict values {unknown}")
+        return self
 
 
 class RubricSection(_Section):
