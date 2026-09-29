@@ -24,7 +24,8 @@ D12 endpoint record, only when an axis needs keywords and no plan is cached yet.
     accepted.jsonl accepted records, post_processed, with provenance under _provenance
     drops.jsonl    every dropped candidate with cell, layer, codes and reason
     summary.json   the scheduler snapshot and drop counts at the end of the run
-    review.jsonl   records L5 queued for people, when hitl.review_flagged and no sink is given
+    review.jsonl   records L5 queued for people, when hitl.review_flagged and no sink is given;
+                   hitl/queue.ReviewQueue.for_run() resolves them into review_decisions.jsonl
     rounds.json    Pipeline.release(): per round, the cells run, the gate outcome, short cells
     shortfall.json the last failed gate, when release() stops without releasing
 
@@ -69,6 +70,7 @@ from sdgf.evaluation.gate import GateResult, evaluate_gate
 from sdgf.evaluation.metrics import MetricsReport, metrics_for_run
 from sdgf.evaluation.reports import write_release, write_shortfall
 from sdgf.generate.generator import Generator
+from sdgf.hitl.queue import require_plan_approval
 from sdgf.judge.calibration import CalibrationResult, CalibrationStore
 from sdgf.judge.interface import Judge
 from sdgf.judge.llm_judge import LLMJudge
@@ -138,7 +140,7 @@ def _bare(record: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class RunReviewSink:
-    """Writes L5 review items to the open run's review stream (until the M8 queue)."""
+    """Writes L5 review items to the open run's review stream, which ReviewQueue.for_run reads."""
 
     def __init__(self) -> None:
         self.writer: JsonlWriter | None = None
@@ -387,6 +389,19 @@ class Pipeline:
         )
         return plan
 
+    def approved_plan(self) -> CoveragePlan:
+        """Stage 1 plus its HITL checkpoint: with hitl.approve_coverage_plan, raise
+        ApprovalPending until a person has approved this plan (hitl/queue.approve_plan).
+        A resumed run that already copied its cells doesn't ask again."""
+        plan = self.plan()
+        if self.compiled.spec.hitl.approve_coverage_plan:
+            require_plan_approval(self.store, self.compiled.spec_version, self.plan_stage)
+        return plan
+
+    @property
+    def plan_stage(self) -> str:
+        return plan_stage_name(self.compiled, self.target_size, self.plan_seed)
+
     def run(
         self,
         run_id: str | None = None,
@@ -399,7 +414,9 @@ class Pipeline:
         run = self.store.open_run(self.compiled.spec_version, run_id)
         run.stage("spec", self._intake_summary)
         target = self.target_size
-        cells = cells_from_json(run.stage("cells", lambda: cells_to_json(self.plan().cells)))
+        cells = cells_from_json(
+            run.stage("cells", lambda: cells_to_json(self.approved_plan().cells))
+        )
         if target is not None and sum(c.quota for c in cells) != target:
             raise PipelineError(
                 f"run {run.run_id!r} was planned for {sum(c.quota for c in cells)} records, "

@@ -191,6 +191,9 @@ class ArtefactStore:
 
     # Shared artefacts outside any run (e.g. a judge calibration), the same files a
     # RunDir of this spec_version reads with shared=True.
+    def shared_path(self, spec_version: str, stage: str) -> Path:
+        return self._shared_path(spec_version, stage)
+
     def has_shared(self, spec_version: str, stage: str) -> bool:
         return self._shared_path(spec_version, stage).is_file()
 
