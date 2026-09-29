@@ -167,7 +167,8 @@ class SeedsSection(_Section):
 
 class Axis(_Section):
     name: str = Field(min_length=1)
-    source: Literal["fixed", "keyword_expansion", "retrieval"] = "fixed"
+    # bloom: the six Bloom levels (coverage/axes.py); values, if given, pick a subset.
+    source: Literal["fixed", "keyword_expansion", "retrieval", "bloom"] = "fixed"
     values: list[Any] | None = None
     weights: list[float] | None = None
 
@@ -175,6 +176,14 @@ class Axis(_Section):
     def _values_match_source(self) -> Axis:
         if self.source == "fixed" and not self.values:
             raise ValueError("a fixed axis needs a non-empty values list")
+        if self.source == "bloom" and self.values is not None:
+            from sdgf.coverage.axes import BLOOM_LEVELS
+
+            unknown = [v for v in self.values if v not in BLOOM_LEVELS]
+            if unknown or not self.values:
+                raise ValueError(f"bloom values must be Bloom levels {list(BLOOM_LEVELS)}")
+        if self.source in ("keyword_expansion", "retrieval") and self.weights is not None:
+            raise ValueError("a keyword axis is split evenly; weights are not allowed")
         if self.weights is not None:
             if self.values is None or len(self.weights) != len(self.values):
                 raise ValueError("weights must have one entry per value")
