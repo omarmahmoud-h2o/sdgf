@@ -1,9 +1,16 @@
-"""The run pipeline (FRAMEWORK_DESIGN.md §5, §6): stages 0 to 3 so far.
+"""The run pipeline (FRAMEWORK_DESIGN.md §5, §6): stages 0 to 5.
 
     0 intake     compile task.yaml + hooks.py + seeds, resolve the task type
     1 coverage   coverage/plan.py: keywords × axes ─► cells × quotas, cached per spec_version
     2 generate   scheduler ─► sampler_constraints ─► prompt ─► generator backend
     3 validate   cascade L1-L6 ─► repair ─► accepted + provenance | drop log
+    4 evaluate   evaluation/metrics.py over the run's artefacts
+    5 gate       evaluation/gate.py ─► release directory | shortfall + refill round
+
+Pipeline.run() is stages 0 to 3; Pipeline.release() runs them, then stages 4 and 5 in
+rounds: a failed gate with short cells sends the scheduler back to fill only those cells
+(with a fresh per-cell attempt allowance, and the budget carried over), until the gate
+passes, max_rounds is reached, the budget runs out, or nothing is left to refill.
 
 Run artefacts live in an ArtefactStore run directory keyed by spec_version:
 
@@ -18,6 +25,8 @@ D12 endpoint record, only when an axis needs keywords and no plan is cached yet.
     drops.jsonl    every dropped candidate with cell, layer, codes and reason
     summary.json   the scheduler snapshot and drop counts at the end of the run
     review.jsonl   records L5 queued for people, when hitl.review_flagged and no sink is given
+    rounds.json    Pipeline.release(): per round, the cells run, the gate outcome, short cells
+    shortfall.json the last failed gate, when release() stops without releasing
 
 When the task lists tools, the generator runs as an agent behind one ToolGateway built
 from the tool registry (tools/registry.REGISTRY unless one is passed), with the
@@ -50,10 +59,15 @@ from collections import Counter
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from datetime import datetime
+from typing import Any, Collection, Iterable, Mapping, Sequence
 
 from sdgf.coverage.axes import keyword_sources
 from sdgf.coverage.plan import DEFAULT_SEED, CoveragePlan, load_or_build_plan, plan_stage_name
+from sdgf.evaluation.diversity import Embedder
+from sdgf.evaluation.gate import GateResult, evaluate_gate
+from sdgf.evaluation.metrics import MetricsReport, metrics_for_run
+from sdgf.evaluation.reports import write_release, write_shortfall
 from sdgf.generate.generator import Generator
 from sdgf.judge.calibration import CalibrationResult, CalibrationStore
 from sdgf.judge.interface import Judge
@@ -88,6 +102,8 @@ JUDGE_LAYERS: tuple[str, ...] = ("L5", "L6")
 ACCEPTED_STREAM = "accepted"
 DROPS_STREAM = "drops"
 REVIEW_STREAM = "review"
+ROUNDS_STAGE = "rounds"
+DEFAULT_MAX_ROUNDS = 3
 
 
 class PipelineError(ValueError):
@@ -147,6 +163,17 @@ class RunResult:
     @property
     def complete(self) -> bool:
         return self.stop_reason == "complete"
+
+
+@dataclass
+class ReleaseResult:
+    run: RunDir
+    released: bool
+    path: Path  # the release directory, or shortfall.json when not released
+    metrics: MetricsReport
+    gate: GateResult
+    rounds: list[dict[str, Any]]  # this invocation's rounds, as in rounds.json
+    stop_reason: str  # released | hard_fail | no_short_cells | max_rounds | budget:...
 
 
 class Pipeline:
@@ -244,6 +271,7 @@ class Pipeline:
             review = self.review_sink
         self.judge: Judge | None = None
         self.trusted = False
+        self.calibration: CalibrationResult | None = None
         implementations = self._layer_implementations(calibration, review, answerer)
         overlap = implementations.get("L4")
         assert overlap is None or isinstance(overlap, OverlapLayer)
@@ -296,6 +324,13 @@ class Pipeline:
             self.trusted = calibration is not None and calibration.trusts(
                 self.compiled.spec_version, judge_name
             )
+            # Stage 4 reads kappa and residual error only from this judge's calibration.
+            if (
+                calibration is not None
+                and calibration.spec_version == self.compiled.spec_version
+                and calibration.judge_id == judge_name
+            ):
+                self.calibration = calibration
         fallback = None
         if "fallback_judge" in self.used_stages:
             fallback = LLMJudge.from_spec(
@@ -352,7 +387,15 @@ class Pipeline:
         )
         return plan
 
-    def run(self, run_id: str | None = None) -> RunResult:
+    def run(
+        self,
+        run_id: str | None = None,
+        *,
+        only: Collection[str] | None = None,
+        prior_usage: Mapping[str, float] | None = None,
+    ) -> RunResult:
+        """Stages 0 to 3. only restricts generation to those cells (a refill round);
+        prior_usage is the usage of earlier rounds, which counts against the budget."""
         run = self.store.open_run(self.compiled.spec_version, run_id)
         run.stage("spec", self._intake_summary)
         target = self.target_size
@@ -363,16 +406,28 @@ class Pipeline:
                 f"not {target}; start a new run to change the target size"
             )
 
+        if only is not None:
+            unknown = sorted(set(only) - {c.id for c in cells})
+            if unknown:
+                raise PipelineError(f"cells {unknown} are not in run {run.run_id!r}")
+        scheduled = [c for c in cells if only is None or c.id in only]
         scheduler = Scheduler(
-            cells, self.compiled.spec.budget, max_attempts_per_cell=self.max_attempts_per_cell
+            scheduled, self.compiled.spec.budget, max_attempts_per_cell=self.max_attempts_per_cell
         )
+        if prior_usage is not None:
+            scheduler.restore_usage(
+                candidates=int(prior_usage.get("candidates", 0)),
+                tokens=int(prior_usage.get("tokens", 0)),
+                cost_usd=float(prior_usage.get("cost_usd", 0.0)),
+                seconds=float(prior_usage.get("seconds", 0.0)),
+            )
         prior = run.read_jsonl(ACCEPTED_STREAM)
         prior_accepted = Counter(r[PROVENANCE_KEY]["cell_id"] for r in prior)
         if self.overlap is not None:
             for r in prior:
                 self.overlap.remember(_bare(r))
         prior_drops = Counter(d["cell_id"] for d in run.read_jsonl(DROPS_STREAM))
-        scheduler.restore_accepted(dict(prior_accepted))
+        scheduler.restore_accepted({c.id: prior_accepted[c.id] for c in scheduled})
         tried = {c.id: prior_accepted[c.id] + prior_drops[c.id] for c in cells}
 
         accepted: list[dict[str, Any]] = []
@@ -401,17 +456,103 @@ class Pipeline:
         snapshot = scheduler.snapshot()
         snapshot["drops"] = {"by_layer": drops.by_layer(), "by_code": drops.by_code()}
         snapshot["skipped_layers"] = list(self.skipped_layers)
+        snapshot["only"] = None if only is None else [c.id for c in scheduled]
         run.write_stage("summary", snapshot)
         return RunResult(
             run=run,
             accepted=accepted,
             drops=drops,
-            counts=scheduler.counts(),
+            counts={c.id: prior_accepted[c.id] for c in cells} | scheduler.counts(),
             stop_reason=scheduler.stop_reason,
             layers=self.layers,
             skipped_layers=self.skipped_layers,
             snapshot=snapshot,
         )
+
+    def release(
+        self,
+        release_root: str | Path,
+        run_id: str | None = None,
+        *,
+        max_rounds: int = DEFAULT_MAX_ROUNDS,
+        waive: Iterable[str] = (),
+        embed: Embedder | None = None,
+        version: str | None = None,
+        now: datetime | None = None,
+    ) -> ReleaseResult:
+        """Stages 0 to 5 in rounds: generate, evaluate, gate; on a failed gate refill only
+        the short cells and gate again, at most max_rounds times in this invocation.
+
+        Releases under release_root on a pass; otherwise writes the shortfall report into
+        the run directory. waive names thresholds whose metric may be unmeasured (e.g.
+        semantic_diversity_min without an embedder); governance can't be waived."""
+        if max_rounds < 1:
+            raise PipelineError("max_rounds must be >= 1")
+        waive = tuple(waive)
+        only: list[str] | None = None
+        usage: Mapping[str, float] | None = None
+        rounds: list[dict[str, Any]] = []
+        history: list[dict[str, Any]] | None = None
+        while True:
+            result = self.run(run_id, only=only, prior_usage=usage)
+            run, run_id = result.run, result.run.run_id
+            usage = result.snapshot["usage"]
+            # Stage 4: every §8 metric over the whole run, not just this round's records.
+            metrics = metrics_for_run(
+                self.compiled,
+                run,
+                calibration=self.calibration,
+                held_out_paths=self.held_out_paths,
+                usage=usage,
+                embed=embed,
+                seed=self.seed,
+            )
+            # Stage 5
+            gate = evaluate_gate(metrics, self.compiled.spec.thresholds, waive=waive)
+            stop = self._round_stop(gate, result, len(rounds) + 1, max_rounds)
+            rounds.append(
+                {
+                    "round": len(rounds) + 1,
+                    "cells": only,
+                    "accepted": len(result.accepted),
+                    "scheduler_stop": result.stop_reason,
+                    "passed": gate.passed,
+                    "hard_fail": gate.hard_fail,
+                    "failing_metrics": gate.failing_metrics,
+                    "short_cells": dict(gate.short_cells),
+                    "outcome": stop or "refill",
+                }
+            )
+            if history is None:  # rounds of earlier invocations of a resumed run
+                history = run.read_stage(ROUNDS_STAGE) if run.has_stage(ROUNDS_STAGE) else []
+            run.write_stage(ROUNDS_STAGE, history + rounds)
+            if stop is not None:
+                break
+            only = sorted(gate.short_cells)
+            log.info("gate failed %s; refilling %d short cells", gate.failing_metrics, len(only))
+
+        if stop == "released":
+            path = write_release(
+                release_root, self.compiled, run, metrics, gate, version=version, now=now
+            )
+        else:
+            path = write_shortfall(run, metrics, gate)
+        return ReleaseResult(run, stop == "released", path, metrics, gate, rounds, stop)
+
+    @staticmethod
+    def _round_stop(gate: GateResult, result: RunResult, n: int, max_rounds: int) -> str | None:
+        """Why the release loop stops after this round, or None to refill the short cells."""
+        if gate.passed:
+            return "released"
+        if gate.hard_fail:
+            return "hard_fail"  # governance: more records can't fix the ones accepted
+        if not gate.short_cells:
+            return "no_short_cells"  # the failures aren't about coverage
+        if result.stop_reason and result.stop_reason.startswith("budget:"):
+            return result.stop_reason
+        if n >= max_rounds:
+            return "max_rounds"
+        return None
 
     def _candidate(
         self, loop: RepairLoop, drops: DropLog, run_id: str, cell: Cell, seed: int

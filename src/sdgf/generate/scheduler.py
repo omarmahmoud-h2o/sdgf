@@ -233,6 +233,15 @@ class Scheduler:
             },
         }
 
+    def restore_usage(
+        self, *, candidates: int = 0, tokens: int = 0, cost_usd: float = 0.0, seconds: float = 0.0
+    ) -> None:
+        """Carry usage over from earlier rounds, so the budget covers the whole run."""
+        if min(candidates, tokens, cost_usd, seconds) < 0:
+            raise SchedulerError("restored usage must be non-negative")
+        self.usage = Usage(candidates, tokens, cost_usd)
+        self._started = self._clock() - seconds
+
     def restore_accepted(self, counts: Mapping[str, int]) -> None:
         """Resume: seed accepted counts (e.g. from an existing accepted stream)."""
         for cid, n in counts.items():
