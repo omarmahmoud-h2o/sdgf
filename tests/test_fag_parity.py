@@ -56,8 +56,12 @@ def _signal_sets(all_signals):
 
 
 def test_fag_hooks_present(hooks):
-    # extra_validators arrives with the M2 L2 task
-    assert set(hooks.present()) == {"label_rule", "sampler_constraints", "post_process"}
+    assert set(hooks.present()) == {
+        "label_rule",
+        "sampler_constraints",
+        "extra_validators",
+        "post_process",
+    }
 
 
 def test_fag_spec_compiles_with_hooks():

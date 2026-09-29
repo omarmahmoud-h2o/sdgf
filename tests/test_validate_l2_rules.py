@@ -223,4 +223,8 @@ def test_fag_label_disagreeing_with_tier_and_scope_fails_at_l2(fag):
     cascade = Cascade([SchemaLayer.from_spec(fag), RulesLayer.from_spec(fag)])
     result = cascade.run(bad, CTX)
     assert result.failed_layer == "L2" and result.repairable
-    assert [e.code for e in result.errors] == ["label_disagrees"]
+    # label agreement is reported first; the FAG extra_validators add the knock-on
+    # errors a flipped label causes (severity and spans now contradict it)
+    got = [e.code for e in result.errors]
+    assert got[0] == "label_disagrees"
+    assert {"severity_on_non_breach", "spans_on_non_breach"} <= set(got)

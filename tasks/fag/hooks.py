@@ -23,6 +23,8 @@ from typing import Any
 
 import yaml
 
+from sdgf.validate.base import ValidationIssue
+
 _SPEC = yaml.safe_load((Path(__file__).with_name("task.yaml")).read_text(encoding="utf-8"))
 P: dict[str, Any] = _SPEC["coverage"]["params"]
 AXES: dict[str, dict[Any, float]] = {
@@ -35,6 +37,7 @@ DOMAIN = list(P["domain_advice_signals"])
 _GENERAL, _PERSONAL = set(GENERAL), set(PERSONAL)
 TIERS = list(P["advice_tier_descriptions"])
 TOPICS = list(P["corps_act_product_topics"]) + list(P["non_corps_act_topics"])
+SIGNALS = set(P["signal_descriptions"])
 ADVICE_SEEKING_STANCES = set(P["advice_seeking_stances"])
 
 
@@ -91,6 +94,149 @@ def unexplained_breach(record: dict[str, Any]) -> bool:
 
 def post_process(record: dict[str, Any]) -> dict[str, Any]:
     return {**record, "policy_categories": derive_policy_categories(record)}
+
+
+# ---------------------------------------------------------------- validators
+
+
+def extra_validators(record: dict[str, Any]) -> list[ValidationIssue]:
+    """FAG rules from scripts/utils.validate_conversation that L1's schema can't express.
+
+    Label agreement with expected_breach is L2's label_rule check, and field types,
+    enums and turn order are L1's, so neither is repeated here.
+    """
+    issues: list[ValidationIssue] = []
+    breach = record.get("label")
+    signals = list(record.get("signal_categories") or [])
+    spans = list(record.get("spans") or [])
+    turns = {m.get("turn"): m for m in record.get("messages") or [] if isinstance(m, dict)}
+
+    for i, sig in enumerate(signals):
+        if sig not in SIGNALS:
+            issues.append(
+                ValidationIssue(
+                    "unknown_signal",
+                    f"{sig!r} is not one of the 15 FAG signal categories",
+                    f"signal_categories[{i}]",
+                    {"got": sig},
+                )
+            )
+
+    # Severity is meaningful only for a breach.
+    severity = record.get("severity")
+    if breach is True and severity is None:
+        issues.append(
+            ValidationIssue("severity_missing", "a breach record needs a severity", "severity")
+        )
+    if breach is False and severity is not None:
+        issues.append(
+            ValidationIssue(
+                "severity_on_non_breach",
+                f"a non-breach record must have severity null, got {severity!r}",
+                "severity",
+                {"got": severity},
+            )
+        )
+
+    # A Corps question is by definition about a Corps Act product.
+    if record.get("is_corps_question") and record.get("product_scope") != "corps_act":
+        issues.append(
+            ValidationIssue(
+                "corps_question_scope",
+                "is_corps_question true requires product_scope corps_act",
+                "is_corps_question",
+                {"product_scope": record.get("product_scope")},
+            )
+        )
+
+    if breach is True and not spans:
+        issues.append(
+            ValidationIssue(
+                "breach_without_span", "a breach record needs at least one span", "spans"
+            )
+        )
+    if breach is False and (spans or record.get("problematic_turns")):
+        # Hard negatives keep their signals, but nothing is problematic.
+        issues.append(
+            ValidationIssue(
+                "spans_on_non_breach",
+                "a non-breach record must have empty spans and problematic_turns",
+                "spans",
+            )
+        )
+
+    span_categories = set()
+    for i, span in enumerate(spans):
+        path = f"spans[{i}]"
+        turn_no = span.get("turn")
+        msg = turns.get(turn_no)
+        if msg is not None and msg.get("role") != "assistant":
+            issues.append(
+                ValidationIssue(
+                    "span_not_assistant",
+                    f"span cites turn {turn_no}, which is not an assistant turn",
+                    f"{path}.turn",
+                    {"turn": turn_no, "role": msg.get("role")},
+                )
+            )
+        # Models reword spans; the quote must be exact.
+        if msg is not None and str(span.get("text", "")) not in str(msg.get("content", "")):
+            issues.append(
+                ValidationIssue(
+                    "span_not_verbatim",
+                    f"span text is not a verbatim substring of turn {turn_no}: "
+                    f"{span.get('text')!r}",
+                    f"{path}.text",
+                    {"turn": turn_no},
+                )
+            )
+        category = span.get("category")
+        span_categories.add(category)
+        if category not in signals:
+            issues.append(
+                ValidationIssue(
+                    "span_category_not_signal",
+                    f"span category {category!r} is not in the record's signal_categories",
+                    f"{path}.category",
+                    {"got": category, "signals": signals},
+                )
+            )
+
+    # Every declared signal must be evidenced by a span.
+    if breach is True:
+        for i, sig in enumerate(signals):
+            if sig not in span_categories:
+                issues.append(
+                    ValidationIssue(
+                        "signal_without_span",
+                        f"signal_category {sig} has no annotated span",
+                        f"signal_categories[{i}]",
+                        {"signal": sig},
+                    )
+                )
+
+    # post_process adds these after validation; a record that already carries them
+    # (a seed, or a re-validated release) must agree with the derivation.
+    if "policy_categories" in record and record["policy_categories"] != derive_policy_categories(
+        record
+    ):
+        issues.append(
+            ValidationIssue(
+                "policy_categories_mismatch",
+                "policy_categories do not match the derivation from signals and context",
+                "policy_categories",
+            )
+        )
+
+    if unexplained_breach(record):
+        issues.append(
+            ValidationIssue(
+                "unexplained_breach",
+                "the breach is not explained by any production policy category",
+                "label",
+            )
+        )
+    return issues
 
 
 # ------------------------------------------------------------------ sampler
