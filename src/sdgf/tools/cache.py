@@ -8,6 +8,9 @@ A cache with a path appends each new entry to a JSONL file as it is stored, so a
 run keeps what it fetched; for_store() puts that file in the spec_version's shared
 artefact area, so every run of the spec reuses it. Only JSON-serialisable results can
 be cached, and lookups return a copy, so a caller can't change a stored response.
+
+get() and put() are thread-safe for concurrent generation; two slots missing the same key
+at once may both run the tool, and the first result stored wins.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 from pathlib import Path
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
@@ -47,6 +51,7 @@ class ToolCache:
         self.path = Path(path) if path is not None else None
         self._entries: dict[str, Any] = {}
         self._writer: JsonlWriter | None = None
+        self._lock = threading.Lock()
         if self.path is not None:
             for lineno, entry in enumerate(iter_jsonl(self.path), 1):
                 try:
@@ -85,9 +90,10 @@ class ToolCache:
     def get(self, tool: str, arguments: Any) -> tuple[bool, Any]:
         """(hit, result); result is a copy of the stored response."""
         key = cache_key(tool, arguments)
-        if key not in self._entries:
-            return False, None
-        return True, copy.deepcopy(self._entries[key])
+        with self._lock:
+            if key not in self._entries:
+                return False, None
+            return True, copy.deepcopy(self._entries[key])
 
     def put(self, tool: str, arguments: Any, result: Any) -> Any:
         """Store a response; returns a copy of it as stored (JSON form, e.g. tuples as lists)."""
@@ -96,16 +102,19 @@ class ToolCache:
             stored = json.loads(json.dumps(result, ensure_ascii=False))
         except (TypeError, ValueError) as e:
             raise ToolCacheError(f"tool {tool!r}: result is not JSON-serialisable: {e}") from None
-        if key in self._entries:
-            return copy.deepcopy(self._entries[key])
-        self._entries[key] = stored
-        if self.path is not None:
-            if self._writer is None:
-                self._writer = JsonlWriter(self.path)
-            self._writer.write({"key": key, "tool": tool, "arguments": arguments, "result": stored})
+        with self._lock:
+            if key in self._entries:
+                return copy.deepcopy(self._entries[key])
+            self._entries[key] = stored
+            if self.path is not None:
+                if self._writer is None:
+                    self._writer = JsonlWriter(self.path)
+                entry = {"key": key, "tool": tool, "arguments": arguments, "result": stored}
+                self._writer.write(entry)
         return copy.deepcopy(stored)
 
     def close(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
-            self._writer = None
+        with self._lock:
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None

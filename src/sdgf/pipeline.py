@@ -43,6 +43,19 @@ L3 (governance) and L4 (overlap) failures are hard drops, never repaired. The L4
 check runs only when held_out_paths is passed to the Pipeline; the path is a run-time
 argument, not recorded in any run artefact, and held-out text never reaches a prompt.
 
+Generation runs in batches ("waves"): each wave reserves every slot the scheduler will
+hand out, runs the slots (generate, validate, repair) on a thread pool of
+max(models.<stage>.concurrency) workers over the generator and judge stages, each backend
+limited to its own stage's concurrency, and then settles them in reservation order.
+Each slot's drops and review items are held until it settles, and L4 checks a wave
+against the corpus as it stood when the wave began, then settle re-checks each record
+against the records settled before it in the same wave (OverlapLayer.check_staged). So
+what a run accepts, and every artefact it writes, depends on the seed and not on the
+number of workers or the order calls finish in. Two limits: a scripted MockBackend
+answers in call order, so it is only order-independent as a callable of the prompt; and
+with tools, a trace entry's cached flag records whether a call was served from the cache,
+which depends on timing.
+
 L5 (judge) and L6 (consistency) build the judge stage, and the fallback judge only when
 the rubric may ask for reasons, so the D12 endpoint record names only models that get
 data. The judge counts as trusted when a calibration result for this spec_version and
@@ -56,12 +69,14 @@ import hashlib
 import json
 import logging
 import random
+import threading
 from collections import Counter
-from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Collection, Iterable, Mapping, Sequence
+from typing import Any, Collection, Iterable, Iterator, Mapping, Sequence
 
 from sdgf.coverage.axes import keyword_sources
 from sdgf.coverage.plan import DEFAULT_SEED, CoveragePlan, load_or_build_plan, plan_stage_name
@@ -75,7 +90,7 @@ from sdgf.judge.calibration import CalibrationResult, CalibrationStore
 from sdgf.judge.interface import Judge
 from sdgf.judge.llm_judge import LLMJudge
 from sdgf.generate.scheduler import Cell, Scheduler
-from sdgf.models.base import ModelBackend
+from sdgf.models.base import BoundedBackend, ModelBackend
 from sdgf.models.registry import StageModels, build_models
 from sdgf.spec.compile import CompiledSpec, compile_spec
 from sdgf.store.artefacts import ArtefactStore, JsonlWriter, RunDir
@@ -100,6 +115,8 @@ log = logging.getLogger(__name__)
 
 IMPLEMENTED_LAYERS: tuple[str, ...] = ("L1", "L2", "L3", "L4", "L5", "L6")
 JUDGE_LAYERS: tuple[str, ...] = ("L5", "L6")
+# Stages whose calls run inside a slot, so on the thread pool; expansion runs before it.
+POOL_STAGES: tuple[str, ...] = ("generator", "judge", "fallback_judge")
 
 ACCEPTED_STREAM = "accepted"
 DROPS_STREAM = "drops"
@@ -149,6 +166,44 @@ class RunReviewSink:
         if self.writer is None:
             raise PipelineError("review item submitted outside a run")
         self.writer.write(item.to_dict())
+
+
+class SlotReviews:
+    """Holds the review items a slot's L5 submits (per thread) until the slot settles, so
+    they reach the real sink in reservation order. Outside a slot items pass straight on."""
+
+    def __init__(self, target: ReviewSink) -> None:
+        self.target = target
+        self._local = threading.local()
+
+    def submit(self, item: ReviewItem) -> None:
+        held = getattr(self._local, "items", None)
+        if held is None:
+            self.target.submit(item)
+        else:
+            held.append(item)
+
+    @contextmanager
+    def capture(self) -> Iterator[list[ReviewItem]]:
+        self._local.items = held = []
+        try:
+            yield held
+        finally:
+            self._local.items = None
+
+
+@dataclass
+class Slot:
+    """One reserved scheduler slot after it ran: an accepted record or None, plus what it
+    logged, which settle writes in reservation order."""
+
+    cell: Cell
+    record: dict[str, Any] | None
+    reason: str
+    drops: list[Drop]
+    reviews: list[ReviewItem]
+    attempts: int = 0
+    history: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclass
@@ -258,6 +313,20 @@ class Pipeline:
             }
         )
         self.models: StageModels = build_models(spec_models, overrides)
+        # Concurrency: one pool sized for the busiest stage, each stage's backend capped
+        # at its own models.<stage>.concurrency. One worker runs the slots inline.
+        limits = {
+            st: (cfg.concurrency if (cfg := getattr(spec_models, st)) is not None else 1)
+            for st in self.used_stages
+            if st in POOL_STAGES
+        }
+        self.workers = max(limits.values())
+        self._bounded: dict[str, ModelBackend] = {
+            st: BoundedBackend(self.models.backend(st), n)
+            if self.workers > 1
+            else self.models.backend(st)
+            for st, n in limits.items()
+        }
         # Tools: the task's allowlist behind one gateway, with the spec_version's shared
         # response cache, so every run of the spec reuses (and can replay) tool results.
         self.tool_cache: ToolCache | None = None
@@ -267,7 +336,7 @@ class Pipeline:
             gateway = ToolGateway(tool_registry.for_task(self.compiled.spec), self.tool_cache)
         self.generator = Generator(
             self.compiled,
-            self.models.backend("generator"),
+            self._bounded["generator"],
             task_type=self.task_type,
             gateway=gateway,
         )
@@ -275,6 +344,8 @@ class Pipeline:
         if review is None and self.compiled.spec.hitl.review_flagged and "L5" in self.layers:
             self.review_sink = RunReviewSink()
             review = self.review_sink
+        self.reviews = SlotReviews(review) if review is not None else None
+        review = self.reviews
         self.judge: Judge | None = None
         self.trusted = False
         self.calibration: CalibrationResult | None = None
@@ -321,7 +392,7 @@ class Pipeline:
             raise PipelineError("held_out_paths needs L4 enabled")
         judge_name = None
         if "judge" in self.used_stages:
-            self.judge = LLMJudge.from_spec(self.compiled, self.models.backend("judge"))
+            self.judge = LLMJudge.from_spec(self.compiled, self._bounded["judge"])
             judge_name = self._judge_id()
             if calibration is None:
                 calibration = CalibrationStore(self.store).load(
@@ -340,7 +411,7 @@ class Pipeline:
         fallback = None
         if "fallback_judge" in self.used_stages:
             fallback = LLMJudge.from_spec(
-                self.compiled, self.models.backend("fallback_judge"), stage="fallback_judge"
+                self.compiled, self._bounded["fallback_judge"], stage="fallback_judge"
             )
         build = {
             "L1": lambda: SchemaLayer.from_spec(self.compiled, self.task_type),
@@ -378,6 +449,7 @@ class Pipeline:
             "skipped_layers": list(self.skipped_layers),
             "held_out_check": self.held_out_paths is not None,
             "judge_trusted": self.trusted,
+            "workers": self.workers,
             "models": self.models.endpoints(),
         }
 
@@ -460,19 +532,30 @@ class Pipeline:
             if self.review_sink is not None:
                 self.review_sink.writer = streams.enter_context(run.jsonl(REVIEW_STREAM))
                 streams.callback(setattr, self.review_sink, "writer", None)
-            loop = RepairLoop(self.generator, self.cascade, drop_log=drops)
-            while (cell := scheduler.next_cell()) is not None:
-                seed = candidate_seed(self.seed, cell.id, tried[cell.id])
-                tried[cell.id] += 1
-                record, reason = self._candidate(loop, drops, run.run_id, cell, seed)
-                if record is None:
-                    scheduler.reject(cell.id, reason)
-                    continue
-                out.write(record)
-                accepted.append(record)
+            pool = None
+            if self.workers > 1:
+                pool = streams.enter_context(ThreadPoolExecutor(self.workers))
+                # an error in one slot shouldn't wait for the rest of the wave to run
+                streams.callback(pool.shutdown, cancel_futures=True)
+            while True:
+                wave: list[tuple[Cell, int]] = []
+                while (cell := scheduler.next_cell()) is not None:
+                    wave.append((cell, candidate_seed(self.seed, cell.id, tried[cell.id])))
+                    tried[cell.id] += 1
+                if not wave:
+                    break
+
+                def one(slot: tuple[Cell, int], run_id: str = run.run_id) -> Slot:
+                    return self._candidate(run_id, *slot)
+
+                # map keeps reservation order; without a pool each slot runs as it settles
+                for slot in pool.map(one, wave) if pool is not None else map(one, wave):
+                    record = self._settle(slot, scheduler, drops)
+                    if record is not None:
+                        out.write(record)
+                        accepted.append(record)
                 if self.overlap is not None:
-                    self.overlap.remember(_bare(record))
-                scheduler.accept(cell.id)
+                    self.overlap.commit_staged()
 
         snapshot = scheduler.snapshot()
         snapshot["drops"] = {"by_layer": drops.by_layer(), "by_code": drops.by_code()}
@@ -575,38 +658,87 @@ class Pipeline:
             return "max_rounds"
         return None
 
-    def _candidate(
-        self, loop: RepairLoop, drops: DropLog, run_id: str, cell: Cell, seed: int
-    ) -> tuple[dict[str, Any] | None, str]:
-        """One scheduler slot: an accepted record with provenance, or None and a reason."""
-        recipe = self.generator.recipe(cell.params, random.Random(seed))
-        if recipe is None:
-            drops.add(
-                Drop(
-                    cell_id=cell.id,
-                    layer=GENERATE_STAGE,
-                    codes=("invalid_cell",),
-                    reason="sampler_constraints rejected the cell",
-                    attempts=0,
+    def _settle(self, slot: Slot, scheduler: Scheduler, drops: DropLog) -> dict[str, Any] | None:
+        """Settle one slot in reservation order; returns the record if it is accepted."""
+        record = slot.record
+        if record is not None and self.overlap is not None:
+            # a near-duplicate of a record settled earlier in the same wave
+            verdict = self.overlap.check_staged(_bare(record))
+            if not verdict.passed:
+                codes = verdict.codes
+                slot.drops.append(
+                    Drop(
+                        cell_id=slot.cell.id,
+                        layer=verdict.layer,
+                        codes=codes,
+                        reason=f"{verdict.layer} {', '.join(codes)} (hard failure, not repaired)",
+                        attempts=slot.attempts,
+                        hard=True,
+                        errors=tuple(e.to_dict() for e in verdict.errors),
+                        history=slot.history + ((verdict.layer, codes),),
+                    )
                 )
+                slot.reviews.clear()  # checked in order, L4 would have stopped it before L5
+                record, slot.reason = None, f"{verdict.layer}:{codes[0]}"
+        for drop in slot.drops:
+            drops.add(drop)
+        if self.reviews is not None:
+            for item in slot.reviews:
+                self.reviews.target.submit(item)
+        if record is None:
+            scheduler.reject(slot.cell.id, slot.reason)
+            return None
+        if self.overlap is not None:
+            self.overlap.stage(_bare(record))
+        scheduler.accept(slot.cell.id)
+        return record
+
+    def _candidate(self, run_id: str, cell: Cell, seed: int) -> Slot:
+        """Run one scheduler slot; thread-safe, and writes nothing until it settles."""
+        local = _HeldDrops()
+        with ExitStack() as stack:
+            reviews = stack.enter_context(self.reviews.capture()) if self.reviews else []
+            slot = Slot(cell, None, "", local.drops, reviews)
+            recipe = self.generator.recipe(cell.params, random.Random(seed))
+            if recipe is None:
+                local.drops.append(
+                    Drop(
+                        cell_id=cell.id,
+                        layer=GENERATE_STAGE,
+                        codes=("invalid_cell",),
+                        reason="sampler_constraints rejected the cell",
+                        attempts=0,
+                    )
+                )
+                slot.reason = f"{GENERATE_STAGE}:invalid_cell"
+                return slot
+
+            prompt = self.generator.prompts.build(recipe)
+            prov = ProvenanceBuilder(
+                self.compiled.spec_version, cell.id, seed, self.models.endpoints(), run_id
             )
-            return None, f"{GENERATE_STAGE}:invalid_cell"
+            loop = RepairLoop(self.generator, self.cascade, drop_log=local)
+            outcome = loop.run(cell.id, recipe, prompt, prov)
+            slot.attempts, slot.history = outcome.attempts, tuple(outcome.history)
+            if outcome.record is None:
+                drop = outcome.drop
+                assert drop is not None
+                slot.reason = f"{drop.layer}:{drop.codes[0] if drop.codes else 'unknown'}"
+                return slot
 
-        prompt = self.generator.prompts.build(recipe)
-        prov = ProvenanceBuilder(
-            self.compiled.spec_version, cell.id, seed, self.models.endpoints(), run_id
-        )
-        outcome = loop.run(cell.id, recipe, prompt, prov)
-        if outcome.record is None:
-            drop = outcome.drop
-            assert drop is not None
-            return None, f"{drop.layer}:{drop.codes[0] if drop.codes else 'unknown'}"
+            record = outcome.record
+            post = self.compiled.hooks.post_process
+            if post is not None:
+                record = post(record)
+            provenance = prov.build()
+            provenance.check_accepted(self.cascade.names)
+            # A JSON round trip makes the returned record identical to the stored line.
+            slot.record = json.loads(json.dumps(attach(record, provenance)))
+            return slot
 
-        record = outcome.record
-        post = self.compiled.hooks.post_process
-        if post is not None:
-            record = post(record)
-        provenance = prov.build()
-        provenance.check_accepted(self.cascade.names)
-        # A JSON round trip makes the returned record identical to the stored line.
-        return json.loads(json.dumps(attach(record, provenance))), ""
+
+class _HeldDrops(DropLog):
+    """A slot's drop log: holds drops for settle to log and write, in reservation order."""
+
+    def add(self, drop: Drop) -> None:
+        self.drops.append(drop)

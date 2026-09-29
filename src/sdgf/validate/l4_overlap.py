@@ -21,6 +21,13 @@ matched text.
 
 Records join the corpus only through remember(), which the pipeline calls once a record is
 accepted: a candidate that passes L4 and then fails L5 must not block later candidates.
+
+Concurrent generation validates a batch of candidates against the corpus as it stood when
+the batch started, so check() must not see records accepted mid-batch. The pipeline
+settles the batch in a fixed order instead: check_staged() compares each candidate with
+the ones already staged from the same batch, stage() adds it, and commit_staged() moves
+the batch into the corpus. The outcome is the same as checking each record against every
+earlier one, whatever order the batch's checks ran in.
 """
 
 from __future__ import annotations
@@ -311,6 +318,8 @@ class OverlapLayer(Layer):
             {source: engine.build() for source in SOURCES} for engine in self.engines
         ]
         self._corpus_size = 0
+        self._staged: list[tuple[str, SimilarityIndex]] = []  # (engine, index) per engine
+        self._staged_records: list[Record] = []
         seeds = list(seeds)
         held = list(held_out) if held_out is not None else []
         for indexes in self._indexes:
@@ -386,33 +395,66 @@ class OverlapLayer(Layer):
                     out[(index.engine, source)] = match
         return out
 
+    # ── staging (a batch settled in order) ───────────────────────
+
+    def stage(self, record: Record) -> None:
+        """Hold an accepted record for commit_staged(); only check_staged() sees it."""
+        if not self._staged:
+            self._staged = [(e, e.build()) for e in self.engines]
+        key = f"corpus:{self._corpus_size + len(self._staged_records)}"
+        text = self.text_of(record)
+        for _, index in self._staged:
+            index.add(key, text)
+        self._staged_records.append(record)
+
+    def check_staged(self, record: Record) -> LayerVerdict:
+        """Near-duplicate check against the staged records only."""
+        text = self.text_of(record)
+        issues: list[ValidationIssue] = []
+        for engine, index in self._staged:
+            issue = self._issue(engine, "corpus", index, text)
+            if issue is not None:
+                issues.append(issue)
+        return self.verdict(issues, repairable=False)
+
+    def commit_staged(self) -> None:
+        for record in self._staged_records:
+            self.remember(record)
+        self._staged, self._staged_records = [], []
+
+    # ── check ────────────────────────────────────────────────────
+
+    def _issue(
+        self, engine: OverlapEngine, source: Source, index: SimilarityIndex, text: str
+    ) -> ValidationIssue | None:
+        limit = engine.thresholds.get(source)
+        if limit is None or not len(index):
+            return None
+        match = index.best(text)
+        if match is None or match.score <= limit:
+            return None
+        return ValidationIssue(
+            code=ISSUE_CODES[source],
+            message=(
+                f"{index.engine} similarity {match.score:.3f} to {source} item "
+                f"{match.key!r} exceeds {limit:.3f}; overlap failures are dropped, "
+                "not repaired"
+            ),
+            details={
+                "source": source,
+                "engine": index.engine,
+                "match": match.key,
+                "score": round(match.score, 4),
+                "threshold": limit,
+            },
+        )
+
     def check(self, record: Record, context: ValidationContext) -> LayerVerdict:
         text = self.text_of(record)
         issues: list[ValidationIssue] = []
         for engine, indexes in zip(self.engines, self._indexes, strict=True):
             for source in SOURCES:
-                limit = engine.thresholds.get(source)
-                index = indexes[source]
-                if limit is None or not len(index):
-                    continue
-                match = index.best(text)
-                if match is None or match.score <= limit:
-                    continue
-                issues.append(
-                    ValidationIssue(
-                        code=ISSUE_CODES[source],
-                        message=(
-                            f"{index.engine} similarity {match.score:.3f} to {source} item "
-                            f"{match.key!r} exceeds {limit:.3f}; overlap failures are dropped, "
-                            "not repaired"
-                        ),
-                        details={
-                            "source": source,
-                            "engine": index.engine,
-                            "match": match.key,
-                            "score": round(match.score, 4),
-                            "threshold": limit,
-                        },
-                    )
-                )
+                issue = self._issue(engine, source, indexes[source], text)
+                if issue is not None:
+                    issues.append(issue)
         return self.verdict(issues, repairable=False)

@@ -11,6 +11,7 @@ the model registry for provenance and the governance report.
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -64,3 +65,31 @@ class ModelBackend(ABC):
         temperature: float,
         tools: list[ToolSpec] | None = None,
     ) -> ModelResponse: ...
+
+
+class BoundedBackend(ModelBackend):
+    """Wraps a backend so at most `limit` calls run at once: models.<stage>.concurrency
+    under the pipeline's thread pool. Name, model and hosting are the wrapped backend's."""
+
+    def __init__(self, inner: ModelBackend, limit: int):
+        if limit < 1:
+            raise ModelBackendError(f"concurrency limit must be >= 1, got {limit}")
+        self.inner = inner
+        self.name = inner.name  # type: ignore[misc]
+        self.model = inner.model
+        self.hosting = inner.hosting
+        self.limit = limit
+        self._slots = threading.BoundedSemaphore(limit)
+
+    def setup(self) -> None:
+        self.inner.setup()
+
+    def call(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        tools: list[ToolSpec] | None = None,
+    ) -> ModelResponse:
+        with self._slots:
+            return self.inner.call(prompt, max_tokens, temperature, tools)

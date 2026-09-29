@@ -235,9 +235,11 @@ def test_drops_are_logged_and_requeued_without_changing_quotas(fag, tmp_path):
     assert len(drops) == 1  # repair_tries 2: three bad replies drop one slot
     assert drops[0]["layer"] == "generate" and drops[0]["codes"] == ["no_json"]
     assert drops[0]["attempts"] == 3
-    # the retry of the dropped slot is in the same cell
-    first_cell = split(result.accepted[0])[1].cell_id
-    assert drops[0]["cell_id"] == first_cell
+    # the retry of the dropped slot is in the same cell (in the next wave)
+    cells = result.run.read_stage("summary")["cells"]
+    dropped = cells[drops[0]["cell_id"]]
+    assert dropped["attempts"] == dropped["quota"] + 1 and dropped["rejected"] == 1
+    assert sum(c["attempts"] for c in cells.values()) == TARGET + 1
     assert result.run.read_stage("summary")["drops"]["by_layer"] == {"generate": 1}
 
 

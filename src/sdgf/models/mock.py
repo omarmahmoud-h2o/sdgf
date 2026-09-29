@@ -10,10 +10,15 @@ Script entries and callable results may be a str (text only), a ToolCall or a li
 ToolCalls (one agent round of tool calls, no text), or a ModelResponse (for text with
 tool calls, or token counts). Every call, with the tools it was offered, is recorded
 in .calls.
+
+Calls are thread-safe. Under concurrent generation a script is consumed in whatever order
+the calls arrive, so tests that compare concurrent runs use a callable computed from the
+prompt, which answers the same whatever the order.
 """
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Callable, Sequence, Union
 
@@ -58,6 +63,7 @@ class MockBackend(ModelBackend):
                 raise ModelBackendError("MockBackend needs at least one scripted response")
         self.cycle = cycle
         self.calls: list[MockCall] = []
+        self._lock = threading.Lock()
 
     def call(
         self,
@@ -69,8 +75,9 @@ class MockBackend(ModelBackend):
         call = MockCall(
             prompt, max_tokens, temperature, tuple(tools) if tools is not None else None
         )
-        index = len(self.calls)
-        self.calls.append(call)
+        with self._lock:
+            index = len(self.calls)
+            self.calls.append(call)
         if self._fn is not None:
             reply = self._fn(call)
         elif index < len(self._script) or self.cycle:
