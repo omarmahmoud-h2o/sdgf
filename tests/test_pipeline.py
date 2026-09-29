@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from sdgf.coverage.axes import cross, resolve_axes
+from sdgf.coverage.plan import assign_quotas, build_plan
 from sdgf.generate.prompts import CELL_HEADER
 from sdgf.models.mock import MockBackend
 from sdgf.pipeline import (
@@ -19,7 +21,6 @@ from sdgf.pipeline import (
     Pipeline,
     PipelineError,
     candidate_seed,
-    fixed_axis_cells,
 )
 from sdgf.spec.compile import compile_spec
 from sdgf.spec.schema import CoverageSection
@@ -122,8 +123,8 @@ def run(fag, tmp_path, backend, *, judge=None, **kw):
 # ── cells ───────────────────────────────────────────────────────
 
 
-def test_fixed_axis_cells_cross_axes_and_sum_to_target(fag):
-    cells = fixed_axis_cells(fag.spec.coverage, TARGET)
+def test_fag_plan_cells_cross_axes_and_sum_to_target(fag):
+    cells = build_plan(fag, target_size=TARGET).cells
     assert len(cells) == 2 * 2 * 4
     assert sum(c.quota for c in cells) == TARGET
     assert cells[0].id == "corps_act|true|single_turn"
@@ -135,7 +136,7 @@ def test_fixed_axis_cells_cross_axes_and_sum_to_target(fag):
 
 
 def test_weighted_quotas_follow_axis_weights(fag):
-    cells = fixed_axis_cells(fag.spec.coverage, 1000)
+    cells = build_plan(fag, target_size=1000).cells
     by_scope = Counter()
     by_label = Counter()
     for c in cells:
@@ -151,13 +152,8 @@ def test_even_quota_policy():
         quota_policy="even",
         axes=[{"name": "a", "values": [1, 2], "weights": [0.9, 0.1]}],
     )
-    assert [c.quota for c in fixed_axis_cells(cov)] == [4, 3]
-
-
-def test_non_fixed_axis_needs_coverage_plan():
-    cov = CoverageSection(target_size=5, axes=[{"name": "topic", "source": "keyword_expansion"}])
-    with pytest.raises(PipelineError, match="coverage plan"):
-        fixed_axis_cells(cov)
+    axes = resolve_axes(cov)
+    assert assign_quotas(cross(axes), axes, {}, cov.target_size) == [4, 3]
 
 
 def test_candidate_seed_is_stable_and_distinct():
@@ -177,7 +173,7 @@ def test_fag_end_to_end_20_records(fag, tmp_path):
     assert len(result.accepted) == TARGET
     assert len(backend.calls) == TARGET  # every candidate accepted first time
     assert len(result.drops) == 0
-    cells = {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
+    cells = {c.id: c.quota for c in build_plan(fag, target_size=TARGET).cells}
     assert result.counts == cells
     assert result.layers == ("L1", "L2", "L3", "L4")
     assert result.skipped_layers == ("L5", "L6")
@@ -234,7 +230,7 @@ def test_drops_are_logged_and_requeued_without_changing_quotas(fag, tmp_path):
 
     _, result = run(fag, tmp_path, MockBackend(reply))
     assert result.complete and len(result.accepted) == TARGET
-    assert result.counts == {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
+    assert result.counts == {c.id: c.quota for c in build_plan(fag, target_size=TARGET).cells}
     drops = result.run.read_jsonl(DROPS_STREAM)
     assert len(drops) == 1  # repair_tries 2: three bad replies drop one slot
     assert drops[0]["layer"] == "generate" and drops[0]["codes"] == ["no_json"]
@@ -273,7 +269,7 @@ def test_resume_finishes_a_killed_run(fag, tmp_path):
     assert len(resumed.accepted) == TARGET - 8
     stored = resumed.run.read_jsonl(ACCEPTED_STREAM)
     assert len(stored) == TARGET
-    cells = {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
+    cells = {c.id: c.quota for c in build_plan(fag, target_size=TARGET).cells}
     assert Counter(split(r)[1].cell_id for r in stored) == Counter(cells)
     seeds = [split(r)[1].seed for r in stored]
     assert len(set(seeds)) == TARGET  # no candidate regenerated with a used seed

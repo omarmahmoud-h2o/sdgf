@@ -14,11 +14,12 @@ from pathlib import Path
 
 import pytest
 
+from sdgf.coverage.plan import build_plan
 from sdgf.judge.calibration import CalibrationResult, CalibrationStore
 from sdgf.judge.jev import JevNotImplementedError
 from sdgf.judge.llm_judge import RECORD_HEADER
 from sdgf.models.mock import MockBackend
-from sdgf.pipeline import DROPS_STREAM, REVIEW_STREAM, Pipeline, PipelineError, fixed_axis_cells
+from sdgf.pipeline import DROPS_STREAM, REVIEW_STREAM, Pipeline, PipelineError
 from sdgf.spec.compile import compile_spec
 from sdgf.store.artefacts import ArtefactStore
 from sdgf.store.provenance import split
@@ -106,7 +107,7 @@ def test_full_run_uses_l1_to_l6_and_fills_every_cell(fag, judged_run):
     _, pipe, result = judged_run
     assert result.layers == LAYERS and result.skipped_layers == ()
     assert result.complete and len(result.accepted) == TARGET
-    assert result.counts == {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
+    assert result.counts == {c.id: c.quota for c in build_plan(fag, target_size=TARGET).cells}
     bare = [split(r)[0] for r in result.accepted]
     assert Counter(r["label"] for r in bare) == {True: 20, False: 20}  # BREACH_RATE 0.5
     spec = result.run.read_stage("spec")

@@ -14,9 +14,10 @@ from pathlib import Path
 
 import pytest
 
+from sdgf.coverage.plan import build_plan
 from sdgf.governance.profile import GLOBAL_PROFILE, profile_for
 from sdgf.models.mock import MockBackend
-from sdgf.pipeline import ACCEPTED_STREAM, DROPS_STREAM, fixed_axis_cells
+from sdgf.pipeline import ACCEPTED_STREAM, DROPS_STREAM
 from sdgf.spec.compile import compile_spec
 from sdgf.store.provenance import split
 from sdgf.validate.base import ValidationContext
@@ -100,7 +101,7 @@ def test_mixed_run_runs_l1_to_l4_and_fills_every_cell(fag, mixed_run):
     assert result.layers == LAYERS
     assert result.skipped_layers == ("L5", "L6")
     assert result.complete and len(result.accepted) == TARGET
-    quotas = {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
+    quotas = {c.id: c.quota for c in build_plan(fag, target_size=TARGET).cells}
     assert result.counts == quotas
     bare = [split(r)[0] for r in result.accepted]
     assert Counter(r["label"] for r in bare) == {True: 20, False: 20}  # BREACH_RATE 0.5
@@ -132,7 +133,7 @@ def test_l1_and_l2_failures_are_repaired_in_their_cell(fag, mixed_run):
     assert any("span_not_verbatim" in p for p in repair_prompts)
     repairs = Counter(split(r)[1].repair_count for r in result.accepted)
     assert set(repairs) == {0, 1} and repairs[1] > 0
-    quotas = {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
+    quotas = {c.id: c.quota for c in build_plan(fag, target_size=TARGET).cells}
     for d in result.run.read_jsonl(DROPS_STREAM):
         assert result.counts[d["cell_id"]] == quotas[d["cell_id"]]
 

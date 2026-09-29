@@ -13,8 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from sdgf.coverage.plan import build_plan
 from sdgf.models.mock import MockBackend
-from sdgf.pipeline import ACCEPTED_STREAM, DROPS_STREAM, fixed_axis_cells
+from sdgf.pipeline import ACCEPTED_STREAM, DROPS_STREAM
 from sdgf.spec.compile import compile_spec
 from sdgf.store.provenance import split
 from sdgf.validate.base import ValidationContext
@@ -88,7 +89,7 @@ def test_mixed_run_fills_every_cell_exactly(fag, mixed_run):
     _, result = mixed_run
     assert result.complete
     assert len(result.accepted) == TARGET
-    quotas = {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
+    quotas = {c.id: c.quota for c in build_plan(fag, target_size=TARGET).cells}
     assert result.counts == quotas
     bare = [split(r)[0] for r in result.accepted]
     assert Counter(r["label"] for r in bare) == {True: 20, False: 20}  # BREACH_RATE 0.5
@@ -114,7 +115,7 @@ def test_mixed_run_drops_junk_and_repairs_the_rest(fag, mixed_run):
     assert any("span_not_verbatim" in p for p in repair_prompts)
 
     # Drops are refilled in their own cell: each dropped cell still met its quota.
-    quotas = {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
+    quotas = {c.id: c.quota for c in build_plan(fag, target_size=TARGET).cells}
     for d in drops:
         assert result.counts[d["cell_id"]] == quotas[d["cell_id"]]
 

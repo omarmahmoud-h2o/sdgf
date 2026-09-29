@@ -1,14 +1,19 @@
-"""The run pipeline (FRAMEWORK_DESIGN.md §5, §6): stages 0, 2 and 3 so far.
+"""The run pipeline (FRAMEWORK_DESIGN.md §5, §6): stages 0 to 3 so far.
 
     0 intake     compile task.yaml + hooks.py + seeds, resolve the task type
-    - cells      fixed axes crossed into cells with quotas (stand-in until stage 1, M5)
+    1 coverage   coverage/plan.py: keywords × axes ─► cells × quotas, cached per spec_version
     2 generate   scheduler ─► sampler_constraints ─► prompt ─► generator backend
     3 validate   cascade L1-L6 ─► repair ─► accepted + provenance | drop log
 
 Run artefacts live in an ArtefactStore run directory keyed by spec_version:
 
     spec.json      stage 0 summary (spec_version, task type, layers run and skipped)
-    cells.json     the cell grid with quotas; reused on resume so quotas can't shift
+    cells.json     this run's cells and quotas, copied from the coverage plan; reused on
+                   resume so quotas can't shift even if the shared plan is rebuilt
+
+The coverage plan itself is shared by every run of a spec_version (coverage_plan.json,
+or a per target and plan seed file). The expansion model is built, and so named in the
+D12 endpoint record, only when an axis needs keywords and no plan is cached yet.
     accepted.jsonl accepted records, post_processed, with provenance under _provenance
     drops.jsonl    every dropped candidate with cell, layer, codes and reason
     summary.json   the scheduler snapshot and drop counts at the end of the run
@@ -33,7 +38,6 @@ leaves out are reported as skipped in spec.json and summary.json, never silently
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import logging
 import random
@@ -43,6 +47,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from sdgf.coverage.axes import keyword_sources
+from sdgf.coverage.plan import DEFAULT_SEED, CoveragePlan, load_or_build_plan, plan_stage_name
 from sdgf.generate.generator import Generator
 from sdgf.judge.calibration import CalibrationResult, CalibrationStore
 from sdgf.judge.interface import Judge
@@ -51,7 +57,6 @@ from sdgf.generate.scheduler import Cell, Scheduler
 from sdgf.models.base import ModelBackend
 from sdgf.models.registry import StageModels, build_models
 from sdgf.spec.compile import CompiledSpec, compile_spec
-from sdgf.spec.schema import CoverageSection
 from sdgf.store.artefacts import ArtefactStore, JsonlWriter, RunDir
 from sdgf.store.provenance import PROVENANCE_KEY, ProvenanceBuilder, attach
 from sdgf.tasktypes.base import TaskType
@@ -80,63 +85,7 @@ class PipelineError(ValueError):
     """The spec or run options can't be run by the pipeline as built so far."""
 
 
-# ── cells (stand-in for the stage 1 coverage plan) ───────────────
-
-
-def _value_id(value: Any) -> str:
-    return value if isinstance(value, str) else json.dumps(value)
-
-
-def _apportion(weights: Sequence[float], total: int) -> list[int]:
-    """Largest-remainder split of `total` in proportion to `weights`; ties go to plan order."""
-    wsum = sum(weights)
-    exact = [w / wsum * total for w in weights]
-    quotas = [int(x) for x in exact]
-    order = sorted(range(len(exact)), key=lambda i: (-(exact[i] - quotas[i]), i))
-    for i in order[: total - sum(quotas)]:
-        quotas[i] += 1
-    return quotas
-
-
-def fixed_axis_cells(coverage: CoverageSection, target_size: int | None = None) -> list[Cell]:
-    """Cross the fixed axes into cells with quotas summing to the target size.
-
-    quota_policy "weighted" makes each cell's share the product of its axis weights;
-    "even" (or an axis without weights) gives every value the same share. Cell ids are
-    the axis values joined with "|", in axis order.
-    """
-    target = coverage.target_size if target_size is None else target_size
-    if target <= 0:
-        raise PipelineError(f"target size must be > 0, got {target}")
-    not_fixed = [a.name for a in coverage.axes if a.source != "fixed"]
-    if not_fixed:
-        raise PipelineError(
-            f"axes {not_fixed} need keyword expansion or retrieval; the stage 1 coverage "
-            "plan is not built yet, so only fixed axes can be run"
-        )
-    weighted = coverage.quota_policy == "weighted"
-    per_axis = []
-    for axis in coverage.axes:
-        assert axis.values is not None
-        ws = axis.weights if weighted and axis.weights is not None else [1.0] * len(axis.values)
-        per_axis.append([(axis.name, v, w) for v, w in zip(axis.values, ws)])
-
-    combos = list(itertools.product(*per_axis))
-    shares = []
-    for combo in combos:
-        share = 1.0
-        for _, _, w in combo:
-            share *= w
-        shares.append(share)
-    quotas = _apportion(shares, target)
-    return [
-        Cell(
-            id="|".join(_value_id(v) for _, v, _ in combo),
-            params={name: v for name, v, _ in combo},
-            quota=q,
-        )
-        for combo, q in zip(combos, quotas)
-    ]
+# ── cells ────────────────────────────────────────────────────────
 
 
 def cells_to_json(cells: Sequence[Cell]) -> list[dict[str, Any]]:
@@ -200,6 +149,7 @@ class Pipeline:
         model_overrides: Mapping[str, ModelBackend] | None = None,
         seed: int = 0,
         target_size: int | None = None,
+        plan_seed: int = DEFAULT_SEED,
         layers: Sequence[str] | None = None,
         max_attempts_per_cell: int | None = None,
         held_out_paths: Iterable[str | Path] | None = None,
@@ -214,6 +164,7 @@ class Pipeline:
         self.store = store if isinstance(store, ArtefactStore) else ArtefactStore(store)
         self.seed = seed
         self.target_size = target_size
+        self.plan_seed = plan_seed
         self.max_attempts_per_cell = max_attempts_per_cell
         self.held_out_paths = list(held_out_paths) if held_out_paths is not None else None
 
@@ -274,8 +225,15 @@ class Pipeline:
         self.overlap: OverlapLayer | None = overlap
         self.cascade = Cascade.from_config(self.layers, implementations)
 
+    def _plan_cached(self) -> bool:
+        stage = plan_stage_name(self.compiled, self.target_size, self.plan_seed)
+        return self.store.has_shared(self.compiled.spec_version, stage)
+
     def _used_stages(self) -> tuple[str, ...]:
         stages = ["generator"]
+        # Stage 1 calls the expansion model only for keyword axes, and only to build a plan.
+        if keyword_sources(self.compiled.spec.coverage) and not self._plan_cached():
+            stages.append("expansion")
         if any(n in JUDGE_LAYERS for n in self.layers):
             stages.append("judge")
         # The fallback judge only writes reasons, so it gets data only if the rubric asks.
@@ -357,16 +315,23 @@ class Pipeline:
             "models": self.models.endpoints(),
         }
 
+    def plan(self) -> CoveragePlan:
+        """Stage 1: the shared coverage plan for this spec_version, built once if absent."""
+        backend = self.models.backend("expansion") if "expansion" in self.used_stages else None
+        plan, _ = load_or_build_plan(
+            self.store,
+            self.compiled,
+            target_size=self.target_size,
+            seed=self.plan_seed,
+            backend=backend,
+        )
+        return plan
+
     def run(self, run_id: str | None = None) -> RunResult:
         run = self.store.open_run(self.compiled.spec_version, run_id)
         run.stage("spec", self._intake_summary)
         target = self.target_size
-        cells = cells_from_json(
-            run.stage(
-                "cells",
-                lambda: cells_to_json(fixed_axis_cells(self.compiled.spec.coverage, target)),
-            )
-        )
+        cells = cells_from_json(run.stage("cells", lambda: cells_to_json(self.plan().cells)))
         if target is not None and sum(c.quota for c in cells) != target:
             raise PipelineError(
                 f"run {run.run_id!r} was planned for {sum(c.quota for c in cells)} records, "

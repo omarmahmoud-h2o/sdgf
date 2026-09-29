@@ -25,7 +25,6 @@ from sdgf.coverage.plan import (
     plan_stage_name,
 )
 from sdgf.models.mock import MockBackend
-from sdgf.pipeline import fixed_axis_cells
 from sdgf.spec.compile import compile_spec
 from sdgf.spec.schema import Axis, parse_spec
 from sdgf.store.artefacts import ArtefactStore
@@ -250,9 +249,7 @@ def test_fag_plan_skips_expansion_and_balances_labels():
         assert sum(c.quota for c in plan.cells) == target
         counts = plan.label_counts("label")
         assert abs(counts["true"] - target * 0.5) <= 1
-        # Same grid and quotas as the pipeline's fixed-axis stand-in.
-        stand_in = fixed_axis_cells(compiled.spec.coverage, target)
-        assert [(c.id, c.quota) for c in plan.cells] == [(c.id, c.quota) for c in stand_in]
+        assert len(plan.cells) == 2 * 2 * 4  # the full fixed grid
 
 
 # ── keyword plan ─────────────────────────────────────────────────
