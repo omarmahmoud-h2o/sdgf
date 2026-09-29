@@ -195,6 +195,7 @@ class Pipeline:
         review: ReviewSink | None = None,
         answerer: Answerer | None = None,
         tool_registry: ToolRegistry | None = None,
+        ignore_unused_overrides: bool = False,
     ):
         # Stage 0: spec schema and hook signatures are checked on load; the task type
         # and its generation mode are resolved here, before any model is built.
@@ -233,7 +234,10 @@ class Pipeline:
         self.used_stages = self._used_stages()
         overrides = dict(model_overrides or {})
         unused = sorted(set(overrides) - set(self.used_stages))
-        if unused:
+        if unused and ignore_unused_overrides:
+            # e.g. a CLI backends plugin that supplies every stage; unused ones get no data
+            overrides = {st: b for st, b in overrides.items() if st in self.used_stages}
+        elif unused:
             raise PipelineError(
                 f"model overrides for stages {unused} that this run doesn't use; "
                 f"it uses {list(self.used_stages)}"

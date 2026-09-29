@@ -14,6 +14,9 @@ dependencies = [
     "numpy",
 ]
 
+[project.scripts]
+sdgf = "sdgf.cli:main"
+
 [project.optional-dependencies]
 pii = ["presidio-analyzer", "presidio-anonymizer"]
 toxicity = ["detoxify"]
