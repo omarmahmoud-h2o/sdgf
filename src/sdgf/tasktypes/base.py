@@ -9,6 +9,8 @@ A task type is the *kind* of dataset. It supplies what every task of that kind s
                          each takes a record and returns a list of errors (empty = pass)
     answer_extractor     text -> answer or None; required for answer_emergent, since
                          K-vote consistency has nothing to vote on without one (§12.1)
+    judge_fields         the record fields a judge may see; never the label or any
+                         field that encodes it, since L5 judges blind (§6.4)
 
 The spec's output_schema.fields are layered on top by output_schema(); a spec field may
 not redefine a field the type owns.
@@ -47,6 +49,10 @@ class TaskType(ABC):
 
     def answer_extractor(self) -> AnswerExtractor | None:
         return None
+
+    def judge_fields(self) -> tuple[str, ...]:
+        """Fields a blind judge sees: every type-owned field except the label."""
+        return tuple(k for k in self.base_schema()["properties"] if k != "label")
 
     def check_definition(self) -> None:
         """Raise TaskTypeError if the type itself is inconsistent; run at registration."""

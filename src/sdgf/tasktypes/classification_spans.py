@@ -106,5 +106,10 @@ class ClassificationSpans(TaskType):
     def default_validators(self) -> list[Validator]:
         return [turn_numbering_errors, span_turn_errors]
 
+    def judge_fields(self) -> tuple[str, ...]:
+        # Spans justify the label (non-empty spans mean a positive), so the judge
+        # sees only the conversation.
+        return ("messages",)
+
 
 CLASSIFICATION_SPANS = REGISTRY.register(ClassificationSpans())
