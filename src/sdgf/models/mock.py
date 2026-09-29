@@ -1,0 +1,84 @@
+"""MockBackend: a scripted or callable-driven backend for tests. Never touches a network.
+
+    MockBackend(["first reply", "second reply"])        # replies in order
+    MockBackend(["same reply"], cycle=True)             # repeats the script
+    MockBackend(lambda call: f"echo {call.prompt}")     # computed per call
+
+Script entries and callable results may be a str (text only) or a ModelResponse
+(for tool calls or token counts). Every call is recorded in .calls.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Sequence, Union
+
+from sdgf.models.base import ModelBackend, ModelBackendError, ModelResponse, ToolSpec
+from sdgf.spec.schema import Hosting
+
+Reply = Union[str, ModelResponse]
+
+
+@dataclass(frozen=True)
+class MockCall:
+    prompt: str
+    max_tokens: int
+    temperature: float
+    tools: tuple[ToolSpec, ...] | None
+
+
+class MockExhaustedError(ModelBackendError):
+    """A non-cycling script ran out of replies."""
+
+
+class MockBackend(ModelBackend):
+    name = "mock"
+    default_hosting = "local"
+
+    def __init__(
+        self,
+        responses: Sequence[Reply] | Callable[[MockCall], Reply],
+        *,
+        model: str = "mock",
+        hosting: Hosting | None = None,
+        cycle: bool = False,
+    ):
+        super().__init__(model, hosting)
+        if callable(responses):
+            self._fn: Callable[[MockCall], Reply] | None = responses
+            self._script: list[Reply] = []
+        else:
+            self._fn = None
+            self._script = list(responses)
+            if not self._script:
+                raise ModelBackendError("MockBackend needs at least one scripted response")
+        self.cycle = cycle
+        self.calls: list[MockCall] = []
+
+    def call(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        tools: list[ToolSpec] | None = None,
+    ) -> ModelResponse:
+        call = MockCall(
+            prompt, max_tokens, temperature, tuple(tools) if tools is not None else None
+        )
+        index = len(self.calls)
+        self.calls.append(call)
+        if self._fn is not None:
+            reply = self._fn(call)
+        elif index < len(self._script) or self.cycle:
+            reply = self._script[index % len(self._script)]
+        else:
+            raise MockExhaustedError(
+                f"MockBackend script exhausted after {len(self._script)} response(s)"
+            )
+        if isinstance(reply, ModelResponse):
+            return reply
+        if isinstance(reply, str) or reply is None:
+            return ModelResponse(text=reply)
+        raise ModelBackendError(
+            f"MockBackend reply must be str or ModelResponse, got {type(reply).__name__}"
+        )
