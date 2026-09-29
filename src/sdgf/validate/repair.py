@@ -66,6 +66,8 @@ class Drop:
     attempts: int  # candidates generated for this slot, including repairs
     hard: bool = False
     errors: tuple[Mapping[str, Any], ...] = ()
+    # (layer, codes) of every failed try, the last one included, for per-layer error rates
+    history: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +78,7 @@ class Drop:
             "attempts": self.attempts,
             "hard": self.hard,
             "errors": [dict(e) for e in self.errors],
+            "history": [[layer, list(codes)] for layer, codes in self.history],
         }
 
 
@@ -217,6 +220,7 @@ class RepairLoop:
             attempts=outcome.attempts,
             hard=hard,
             errors=tuple(e.to_dict() for e in errors),
+            history=tuple(outcome.history),
         )
         self.drop_log.add(drop)
         outcome.drop = drop
