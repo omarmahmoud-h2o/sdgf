@@ -16,52 +16,31 @@ match is the finding.
 from __future__ import annotations
 
 import re
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
-from sdgf.governance._util import GovernanceEngineError, iter_strings, lazy_import
+from sdgf.governance._util import (
+    Finding,
+    GovernanceEngineError,
+    TextScanner,
+    lazy_import,
+    sort_findings,
+)
 from sdgf.governance.profile import GLOBAL_PROFILE, GovernanceProfile
 
 
 @dataclass(frozen=True)
-class PIIFinding:
-    rule: str
-    text: str
-    start: int
-    end: int
-    path: str = ""
-    engine: str = "regex"
-    score: float = 1.0
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "rule": self.rule,
-            "text": self.text,
-            "start": self.start,
-            "end": self.end,
-            "path": self.path,
-            "engine": self.engine,
-            "score": self.score,
-        }
+class PIIFinding(Finding):
+    scanner: ClassVar[str] = "pii"
 
 
-class PIIScanner(ABC):
+class PIIScanner(TextScanner):
     """One interface for every PII engine."""
-
-    engine: str = ""
 
     @abstractmethod
     def scan_text(self, text: str, path: str = "") -> list[PIIFinding]: ...
-
-    def scan_record(
-        self, record: Mapping[str, Any], *, skip_private: bool = True
-    ) -> list[PIIFinding]:
-        findings: list[PIIFinding] = []
-        for path, text in iter_strings(record, skip_private=skip_private):
-            findings.extend(self.scan_text(text, path))
-        return findings
 
 
 # ── regex baseline ───────────────────────────────────────────────
@@ -121,7 +100,7 @@ class RegexPIIScanner(PIIScanner):
                 group = "pii" if "pii" in pattern.groupindex and m.group("pii") else 0
                 start, end = m.span(group)
                 findings.append(PIIFinding(rule, text[start:end], start, end, path, self.engine))
-        return sorted(findings, key=lambda f: (f.start, f.end, f.rule))
+        return sort_findings(findings)
 
 
 # ── optional Presidio adapter ────────────────────────────────────
@@ -180,7 +159,7 @@ class PresidioPIIScanner(PIIScanner):
             for r in results
             if r.score >= self.score_threshold
         ]
-        return sorted(findings, key=lambda f: (f.start, f.end, f.rule))
+        return sort_findings(findings)
 
 
 @dataclass
@@ -193,7 +172,7 @@ class CompositePIIScanner(PIIScanner):
 
     def scan_text(self, text: str, path: str = "") -> list[PIIFinding]:
         findings = [f for s in self.scanners for f in s.scan_text(text, path)]
-        return sorted(findings, key=lambda f: (f.start, f.end, f.rule, f.engine))
+        return sort_findings(findings)
 
 
 ENGINES: tuple[str, ...] = ("regex", "presidio")

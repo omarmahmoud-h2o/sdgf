@@ -123,6 +123,7 @@ def test_scan_record_walks_nested_strings_with_paths():
 def test_finding_to_dict():
     f = PIIFinding("tfn", "000 000 000", 4, 15, "messages[0].content")
     assert f.to_dict() == {
+        "scanner": "pii",
         "rule": "tfn",
         "text": "000 000 000",
         "start": 4,
