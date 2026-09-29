@@ -1,5 +1,6 @@
-"""Pipeline stages 0, 2 and 3 (L1, L2) end to end on the FAG spec with a MockBackend."""
+"""Pipeline stages 0, 2 and 3 (L1-L4) end to end on the FAG spec with a MockBackend."""
 
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -19,6 +20,7 @@ from sdgf.pipeline import (
 from sdgf.spec.compile import compile_spec
 from sdgf.spec.schema import CoverageSection
 from sdgf.store.provenance import split
+from sdgf.validate.base import ValidationContext
 
 FAG_DIR = Path(__file__).resolve().parents[1] / "tasks" / "fag"
 TARGET = 20
@@ -39,6 +41,22 @@ def recipe_from_prompt(prompt: str) -> dict:
     return recipe
 
 
+WORDS = (
+    "invoice ledger payroll merchant terminal settlement overdraft facility statement "
+    "transfer deposit withdrawal branch online portal card limit review schedule quarter "
+    "supplier customer inventory warehouse delivery contract renewal notice balance "
+    "interest fee waiver rebate cashflow forecast budget expense receipt audit "
+    "morning evening weekly monthly annual regional metro rural coastal inland "
+    "bakery joinery nursery studio workshop clinic cafe garage florist printer"
+).split()
+
+
+def filler(recipe: dict, turn: int, n: int = 12) -> str:
+    """Words drawn from a hash of the recipe, so distinct recipes don't read alike at L4."""
+    digest = hashlib.sha256(f"{json.dumps(recipe, sort_keys=True)}:{turn}".encode()).digest()
+    return " ".join(WORDS[b % len(WORDS)] for b in digest[:n])
+
+
 def fag_reply(recipe: dict, *, reword: bool = False) -> dict:
     """A valid model reply for a FAG recipe: one advisory sentence per declared signal."""
     turns = recipe["turn_count"]
@@ -48,11 +66,11 @@ def fag_reply(recipe: dict, *, reword: bool = False) -> dict:
     messages = []
     for turn in range(1, turns + 1):
         if turn % 2:
-            content = f"Customer question {turn} about the {recipe['primary_topic']}."
+            content = f"Question about the {recipe['primary_topic']}: {filler(recipe, turn)}."
         elif turn == turns:
-            content = " ".join(["Thanks for asking.", *advisory, sentences[0]])
+            content = " ".join([f"Thanks: {filler(recipe, turn)}.", *advisory, sentences[0]])
         else:
-            content = f"Factual answer {turn}: the monthly fee is $10."
+            content = f"Factual answer, the monthly fee is $10: {filler(recipe, turn)}."
         messages.append(
             {"turn": turn, "role": "customer" if turn % 2 else "assistant", "content": content}
         )
@@ -151,15 +169,15 @@ def test_fag_end_to_end_20_records(fag, tmp_path):
     assert len(result.drops) == 0
     cells = {c.id: c.quota for c in fixed_axis_cells(fag.spec.coverage, TARGET)}
     assert result.counts == cells
-    assert result.layers == ("L1", "L2")
-    assert result.skipped_layers == ("L3", "L4", "L5", "L6")
+    assert result.layers == ("L1", "L2", "L3", "L4")
+    assert result.skipped_layers == ("L5", "L6")
 
     stored = result.run.read_jsonl(ACCEPTED_STREAM)
     assert stored == result.accepted
     assert result.run.read_jsonl(DROPS_STREAM) == []
     for rec in stored:
         bare, prov = split(rec)
-        prov.check_accepted(("L1", "L2"))
+        prov.check_accepted(("L1", "L2", "L3", "L4"))
         assert prov.spec_version == fag.spec_version
         assert prov.run_id == "r1"
         assert prov.repair_count == 0
@@ -174,7 +192,8 @@ def test_fag_end_to_end_20_records(fag, tmp_path):
 
     spec = result.run.read_stage("spec")
     assert spec["task_type"] == "classification_spans"
-    assert spec["skipped_layers"] == ["L3", "L4", "L5", "L6"]
+    assert spec["skipped_layers"] == ["L5", "L6"]
+    assert spec["held_out_check"] is False
     summary = result.run.read_stage("summary")
     assert summary["stop_reason"] == "complete"
     assert summary["drops"]["by_layer"] == {}
@@ -258,7 +277,7 @@ def test_resume_with_a_different_target_is_refused(fag, tmp_path):
 
 def test_unimplemented_layers_are_refused(fag, tmp_path):
     with pytest.raises(PipelineError, match="not implemented"):
-        Pipeline(fag, tmp_path, model_overrides={"generator": valid_backend()}, layers=["L1", "L3"])
+        Pipeline(fag, tmp_path, model_overrides={"generator": valid_backend()}, layers=["L1", "L5"])
 
 
 def test_explicit_layer_subset(fag, tmp_path):
@@ -266,3 +285,100 @@ def test_explicit_layer_subset(fag, tmp_path):
     assert result.layers == ("L1",)
     assert result.skipped_layers == ("L2", "L3", "L4", "L5", "L6")
     split(result.accepted[0])[1].check_accepted(("L1",))
+
+
+# ── L3 and L4 in the pipeline ──────────────────────────────────
+
+
+def test_governance_failure_is_dropped_without_repair_and_refilled(fag, tmp_path):
+    calls = []
+
+    def reply(call):
+        calls.append(call)
+        r = fag_reply(recipe_from_prompt(call.prompt))
+        if len(calls) == 1:
+            r["messages"][0]["content"] += " My TFN is 000 000 000."  # fictional
+        return json.dumps(r)
+
+    _, result = run(fag, tmp_path, MockBackend(reply))
+    assert result.complete and len(result.accepted) == TARGET
+    drops = result.run.read_jsonl(DROPS_STREAM)
+    assert len(drops) == 1
+    assert drops[0]["layer"] == "L3" and drops[0]["codes"] == ["pii_tfn"]
+    assert drops[0]["hard"] is True and drops[0]["attempts"] == 1  # never repaired
+    assert "000 000 000" not in json.dumps(drops)  # the drop log doesn't copy the TFN
+    assert not any("previous attempt was rejected" in c.prompt for c in calls)
+
+
+def test_near_duplicate_of_an_accepted_record_is_dropped(fag, tmp_path):
+    template = {}
+
+    def reply(call):
+        # Non-breach candidates copy the text of the first non-breach reply of their length.
+        recipe = recipe_from_prompt(call.prompt)
+        r = fag_reply(recipe)
+        if not recipe["label"]:
+            r["messages"] = template.setdefault(len(r["messages"]), r["messages"])
+        return json.dumps(r)
+
+    _, result = run(fag, tmp_path, MockBackend(reply), max_attempts_per_cell=3)
+    drops = result.run.read_jsonl(DROPS_STREAM)
+    assert drops and {d["layer"] for d in drops} == {"L4"}
+    assert {c for d in drops for c in d["codes"]} == {"near_duplicate"}
+    assert all(d["hard"] and d["attempts"] == 1 for d in drops)
+    assert all("|false|" in d["cell_id"] for d in drops)
+    lengths = Counter(
+        len(split(r)[0]["messages"]) for r in result.accepted if not split(r)[0]["label"]
+    )
+    assert all(n == 1 for n in lengths.values())  # one accepted copy per template
+
+
+def test_resume_rebuilds_the_near_duplicate_corpus(fag, tmp_path):
+    _, done = run(fag, tmp_path, valid_backend())
+    pipe = Pipeline(
+        fag, tmp_path / "store", model_overrides={"generator": valid_backend()}, target_size=TARGET
+    )
+    assert pipe.overlap is not None and pipe.overlap.corpus_size == 0
+    resumed = pipe.run("r1")  # already complete: nothing new, but the corpus is rebuilt
+    assert resumed.accepted == []
+    assert pipe.overlap.corpus_size == TARGET
+    verdict = pipe.overlap.check(split(done.accepted[0])[0], ValidationContext(cell_id="t"))
+    assert verdict.outcome == "fail_hard"
+    assert verdict.errors[0].code == "near_duplicate"
+
+
+def test_held_out_check_is_opt_in(fag, tmp_path):
+    _, plain = run(fag, tmp_path / "a", valid_backend())
+    assert plain.run.read_stage("spec")["held_out_check"] is False
+    held = tmp_path / "held_out.jsonl"
+    first = split(plain.accepted[0])[0]
+    held.write_text(json.dumps({"messages": first["messages"]}) + "\n")
+
+    pipe = Pipeline(
+        fag,
+        tmp_path / "b",
+        model_overrides={"generator": valid_backend()},
+        held_out_paths=[held],
+        target_size=TARGET,
+    )
+    assert pipe.overlap is not None and pipe.overlap.held_out_enabled
+    result = pipe.run("r1")
+    assert result.complete and len(result.accepted) == TARGET
+    spec = result.run.read_stage("spec")
+    assert spec["held_out_check"] is True
+    assert str(held) not in json.dumps(spec)  # the path isn't recorded
+    drops = result.run.read_jsonl(DROPS_STREAM)
+    # The same seed regenerates the held-out copy first; it drops and the cell refills.
+    assert [(d["layer"], d["codes"]) for d in drops] == [("L4", ["held_out_overlap"])]
+    assert first["messages"] not in [split(r)[0]["messages"] for r in result.accepted]
+
+
+def test_held_out_paths_need_l4(fag, tmp_path):
+    with pytest.raises(PipelineError, match="needs L4"):
+        Pipeline(
+            fag,
+            tmp_path,
+            model_overrides={"generator": valid_backend()},
+            layers=["L1", "L2"],
+            held_out_paths=[tmp_path / "x.jsonl"],
+        )

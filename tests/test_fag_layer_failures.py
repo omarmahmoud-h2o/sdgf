@@ -1,21 +1,29 @@
-"""Hand-built FAG records that each fail exactly one of L1 or L2.
+"""Hand-built FAG records that each fail exactly one of L1, L2, L3 or L4.
 
 Each record starts from a valid seed and breaks one thing, then runs through the
-L1 -> L2 cascade the pipeline builds. The cascade must stop at the expected layer with
-the expected error codes, and nothing else may fire.
+L1 -> L2 -> L3 -> L4 cascade the pipeline builds. The cascade must stop at the expected
+layer with the expected error codes, and nothing else may fire. L1 and L2 failures are
+repairable; L3 and L4 failures are hard drops.
+
+A seed is itself a copy of a seed, so unmodified seeds pass L1-L3 and stop at L4. The L3
+cases fail before L4 is reached; the near-duplicate case uses fresh fictional text.
 """
 
 import copy
 
 import pytest
 
+from pathlib import Path
+
+from sdgf.models.mock import MockBackend
+from sdgf.pipeline import Pipeline
+from sdgf.spec.compile import compile_spec
 from sdgf.validate.base import ValidationContext
 from sdgf.validate.cascade import Cascade
 from sdgf.validate.l1_schema import SchemaLayer
 from sdgf.validate.l2_rules import RulesLayer
-from sdgf.spec.compile import compile_spec
-
-from pathlib import Path
+from sdgf.validate.l3_governance import GovernanceLayer
+from sdgf.validate.l4_overlap import OverlapLayer
 
 FAG_DIR = Path(__file__).resolve().parents[1] / "tasks" / "fag"
 
@@ -25,12 +33,25 @@ def fag():
     return compile_spec(FAG_DIR)
 
 
-@pytest.fixture(scope="module")
-def cascade(fag):
+ALL = ("L1", "L2", "L3", "L4")
+
+
+def build_cascade(fag):
     return Cascade.from_config(
-        ["L1", "L2"],
-        {"L1": SchemaLayer.from_spec(fag), "L2": RulesLayer.from_spec(fag)},
+        list(ALL),
+        {
+            "L1": SchemaLayer.from_spec(fag),
+            "L2": RulesLayer.from_spec(fag),
+            "L3": GovernanceLayer.from_spec(fag),
+            "L4": OverlapLayer.from_spec(fag),
+        },
     )
+
+
+@pytest.fixture
+def cascade(fag):
+    # Function scope: L4 remembers accepted records, which must not leak between tests.
+    return build_cascade(fag)
 
 
 @pytest.fixture(scope="module")
@@ -46,11 +67,56 @@ def run(cascade, record):
     return cascade.run(record, ValidationContext(cell_id="test"))
 
 
-def test_every_seed_passes_l1_and_l2(cascade, seeds):
+def fresh_record(seeds) -> dict:
+    """Seed 5 (non-breach, no spans) with new fictional text, so it overlaps no seed."""
+    r = seed(seeds, 5)
+    r["messages"] = [
+        {
+            "turn": 1,
+            "role": "customer",
+            "content": "Our joinery workshop in Testville wants to know how the trade card "
+            "statement cycle lines up with supplier invoices each month.",
+        },
+        {
+            "turn": 2,
+            "role": "assistant",
+            "content": "The trade card statement closes on the fifteenth, and the balance is "
+            "due twenty-five days later. Supplier payments made after the close appear on "
+            "the following statement.",
+        },
+        {
+            "turn": 3,
+            "role": "customer",
+            "content": "Should we switch our timber orders to the card to stretch cash flow?",
+        },
+        {
+            "turn": 4,
+            "role": "assistant",
+            "content": "I can't tell you whether that suits your business, as that would be "
+            "personal advice. I can explain the fees, the interest-free days and how "
+            "the limit is set, if that helps.",
+        },
+    ]
+    return r
+
+
+def test_the_pipeline_cascade_is_l1_to_l4(fag, tmp_path):
+    pipe = Pipeline(fag, tmp_path, model_overrides={"generator": MockBackend(["{}"])})
+    assert pipe.cascade.names == ALL
+    assert pipe.overlap is not None
+
+
+def test_every_seed_passes_l1_to_l3(cascade, seeds):
     for s in seeds.values():
         result = run(cascade, copy.deepcopy(s))
-        assert result.passed, (s["conversation_id"], result.errors)
-        assert result.layers_run == ("L1", "L2")
+        assert result.layers_run == ALL, (s["conversation_id"], result.errors)
+        assert result.failed_layer == "L4"  # a seed copies itself; see test_copied_seed
+
+
+def test_fresh_record_passes_every_layer(cascade, seeds):
+    result = run(cascade, fresh_record(seeds))
+    assert result.passed, result.errors
+    assert result.layers_run == ALL
 
 
 # --- L1 -------------------------------------------------------------------------------
@@ -141,3 +207,59 @@ def test_missing_span_for_declared_signal_stops_at_l2(cascade, seeds):
     assert result.repairable
     assert [e.code for e in result.errors] == ["signal_without_span"]
     assert "PRODUCT_RECOMMENDATION" in result.errors[0].message
+
+
+# --- L3 -------------------------------------------------------------------------------
+
+
+def assert_hard_drop_at(result, layer, codes):
+    assert result.failed_layer == layer
+    assert result.layers_run == ALL[: ALL.index(layer) + 1]
+    assert all(v.outcome == "pass" for v in result.verdicts[:-1])
+    assert result.hard and not result.repairable
+    assert [e.code for e in result.errors] == codes
+
+
+def test_embedded_fictional_tfn_passes_l2_and_stops_at_l3(cascade, seeds):
+    r = seed(seeds, 5)
+    r["messages"][0]["content"] += " My TFN is 000 000 000 if you need it."
+    result = run(cascade, r)
+    assert_hard_drop_at(result, "L3", ["pii_tfn"])
+    assert result.errors[0].path == "messages[0].content"
+    assert "000 000 000" not in str(result.errors[0]) + str(result.errors[0].details)
+
+
+def test_secret_like_token_passes_l2_and_stops_at_l3(cascade, seeds):
+    r = seed(seeds, 6)
+    token = "sk-" + "0" * 32  # fictional, secret-shaped
+    r["messages"][1]["content"] += f" Use the API key {token} to connect the terminal."
+    result = run(cascade, r)
+    assert_hard_drop_at(result, "L3", ["secrets_api_key"])
+    assert result.errors[0].path == "messages[1].content"
+    assert token not in str(result.errors[0]) + str(result.errors[0].details)
+
+
+# --- L4 -------------------------------------------------------------------------------
+
+
+def test_copied_seed_passes_l3_and_stops_at_l4(cascade, seeds):
+    r = seed(seeds, 1)
+    result = run(cascade, r)
+    assert_hard_drop_at(result, "L4", ["seed_overlap"])
+    assert result.errors[0].details["match"] == "seed:0"
+    assert result.errors[0].details["score"] == 1.0
+
+
+def test_near_duplicate_of_an_accepted_record_stops_at_l4(cascade, seeds):
+    original = fresh_record(seeds)
+    assert run(cascade, original).passed
+    overlap = cascade.layers[-1]
+    assert isinstance(overlap, OverlapLayer)
+    overlap.remember(original, key="SYN-FAG-000001")
+
+    dup = copy.deepcopy(original)
+    dup["messages"][0]["content"] = dup["messages"][0]["content"].replace("joinery", "cabinet")
+    result = run(cascade, dup)
+    assert_hard_drop_at(result, "L4", ["near_duplicate"])
+    assert result.errors[0].details["match"] == "SYN-FAG-000001"
+    assert result.errors[0].details["score"] > 0.8

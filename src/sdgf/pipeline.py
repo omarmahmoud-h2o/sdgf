@@ -3,7 +3,7 @@
     0 intake     compile task.yaml + hooks.py + seeds, resolve the task type
     - cells      fixed axes crossed into cells with quotas (stand-in until stage 1, M5)
     2 generate   scheduler ─► sampler_constraints ─► prompt ─► generator backend
-    3 validate   cascade (L1, L2 for now) ─► repair ─► accepted + provenance | drop log
+    3 validate   cascade (L1-L4 for now) ─► repair ─► accepted + provenance | drop log
 
 Run artefacts live in an ArtefactStore run directory keyed by spec_version:
 
@@ -15,10 +15,15 @@ Run artefacts live in an ArtefactStore run directory keyed by spec_version:
 
 Reopening an existing run id resumes it: accepted counts are restored per cell from
 accepted.jsonl, and per-candidate seeds continue from where the run stopped, so a
-resumed run never regenerates a candidate it already tried.
+resumed run never regenerates a candidate it already tried. The L4 near-duplicate corpus
+is rebuilt from accepted.jsonl too, so a resumed run can't accept a copy of an earlier record.
 
-Only L1 and L2 are implemented; enabled layers without an implementation are reported
-as skipped in spec.json and summary.json rather than silently ignored.
+L3 (governance) and L4 (overlap) failures are hard drops, never repaired. The L4 held-out
+check runs only when held_out_paths is passed to the Pipeline; the path is a run-time
+argument, not recorded in any run artefact, and held-out text never reaches a prompt.
+
+L1-L4 are implemented; enabled layers without an implementation are reported as skipped
+in spec.json and summary.json rather than silently ignored.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import random
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from sdgf.generate.generator import Generator
 from sdgf.generate.scheduler import Cell, Scheduler
@@ -47,11 +52,13 @@ from sdgf.validate.base import Layer
 from sdgf.validate.cascade import Cascade
 from sdgf.validate.l1_schema import SchemaLayer
 from sdgf.validate.l2_rules import RulesLayer
+from sdgf.validate.l3_governance import GovernanceLayer
+from sdgf.validate.l4_overlap import OverlapLayer
 from sdgf.validate.repair import GENERATE_STAGE, Drop, DropLog, RepairLoop
 
 log = logging.getLogger(__name__)
 
-IMPLEMENTED_LAYERS: tuple[str, ...] = ("L1", "L2")
+IMPLEMENTED_LAYERS: tuple[str, ...] = ("L1", "L2", "L3", "L4")
 USED_STAGES: tuple[str, ...] = ("generator",)  # model stages run so far; judge arrives with L5
 
 ACCEPTED_STREAM = "accepted"
@@ -141,6 +148,10 @@ def candidate_seed(run_seed: int, cell_id: str, index: int) -> int:
 # ── pipeline ─────────────────────────────────────────────────────
 
 
+def _bare(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in record.items() if k != PROVENANCE_KEY}
+
+
 @dataclass
 class RunResult:
     run: RunDir
@@ -168,6 +179,7 @@ class Pipeline:
         target_size: int | None = None,
         layers: Sequence[str] | None = None,
         max_attempts_per_cell: int | None = None,
+        held_out_paths: Iterable[str | Path] | None = None,
     ):
         # Stage 0: spec schema and hook signatures are checked on load; the task type
         # and its generation mode are resolved here, before any model is built.
@@ -177,6 +189,7 @@ class Pipeline:
         self.seed = seed
         self.target_size = target_size
         self.max_attempts_per_cell = max_attempts_per_cell
+        self.held_out_paths = list(held_out_paths) if held_out_paths is not None else None
 
         configured = self.compiled.spec.validation.layers
         if layers is None:
@@ -207,13 +220,23 @@ class Pipeline:
         self.generator = Generator(
             self.compiled, self.models.backend("generator"), task_type=self.task_type
         )
-        self.cascade = Cascade.from_config(self.layers, self._layer_implementations())
+        implementations = self._layer_implementations()
+        overlap = implementations.get("L4")
+        assert overlap is None or isinstance(overlap, OverlapLayer)
+        self.overlap: OverlapLayer | None = overlap
+        self.cascade = Cascade.from_config(self.layers, implementations)
 
     def _layer_implementations(self) -> dict[str, Layer]:
-        return {
-            "L1": SchemaLayer.from_spec(self.compiled, self.task_type),
-            "L2": RulesLayer.from_spec(self.compiled),
+        """Only the enabled layers are built, so e.g. L4 doesn't need overlap_max without L4."""
+        build = {
+            "L1": lambda: SchemaLayer.from_spec(self.compiled, self.task_type),
+            "L2": lambda: RulesLayer.from_spec(self.compiled),
+            "L3": lambda: GovernanceLayer.from_spec(self.compiled),
+            "L4": lambda: OverlapLayer.from_spec(self.compiled, held_out_paths=self.held_out_paths),
         }
+        if self.held_out_paths is not None and "L4" not in self.layers:
+            raise PipelineError("held_out_paths needs L4 enabled")
+        return {name: build[name]() for name in self.layers}
 
     def _intake_summary(self) -> dict[str, Any]:
         spec = self.compiled.spec
@@ -226,6 +249,7 @@ class Pipeline:
             "seeds": len(self.compiled.seeds),
             "layers": list(self.layers),
             "skipped_layers": list(self.skipped_layers),
+            "held_out_check": self.held_out_paths is not None,
             "models": self.models.endpoints(),
         }
 
@@ -248,9 +272,11 @@ class Pipeline:
         scheduler = Scheduler(
             cells, self.compiled.spec.budget, max_attempts_per_cell=self.max_attempts_per_cell
         )
-        prior_accepted = Counter(
-            r[PROVENANCE_KEY]["cell_id"] for r in run.read_jsonl(ACCEPTED_STREAM)
-        )
+        prior = run.read_jsonl(ACCEPTED_STREAM)
+        prior_accepted = Counter(r[PROVENANCE_KEY]["cell_id"] for r in prior)
+        if self.overlap is not None:
+            for r in prior:
+                self.overlap.remember(_bare(r))
         prior_drops = Counter(d["cell_id"] for d in run.read_jsonl(DROPS_STREAM))
         scheduler.restore_accepted(dict(prior_accepted))
         tried = {c.id: prior_accepted[c.id] + prior_drops[c.id] for c in cells}
@@ -268,6 +294,8 @@ class Pipeline:
                     continue
                 out.write(record)
                 accepted.append(record)
+                if self.overlap is not None:
+                    self.overlap.remember(_bare(record))
                 scheduler.accept(cell.id)
 
         snapshot = scheduler.snapshot()
