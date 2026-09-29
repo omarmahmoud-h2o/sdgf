@@ -31,7 +31,17 @@ models:
     model: mock-1
 validation:
   layers: [L1, L2]
-thresholds: {}
+thresholds:
+  fidelity_min: 0.95
+  kappa_min: 0.8
+  coverage_min_cell_fill: 0.9
+  balance_tolerance: 0.05
+  distinct_n_min: 0.3
+  self_bleu_max: 0.6
+  semantic_diversity_min: 1.0
+  residual_error_max: 0.05
+  overlap_max: 0.8
+  cost_per_record_max: 0.05
 """
 
 HOOKS = """\
@@ -135,7 +145,7 @@ def test_invalid_yaml(task_dir):
 
 
 def test_schema_errors_propagate(task_dir):
-    (task_dir / "task.yaml").write_text(TASK_YAML.replace("thresholds: {}\n", ""), encoding="utf-8")
+    (task_dir / "task.yaml").write_text(TASK_YAML.split("thresholds:")[0], encoding="utf-8")
     with pytest.raises(SpecValidationError) as exc:
         compile_spec(task_dir)
     assert "thresholds" in [path for path, _ in exc.value.errors]
