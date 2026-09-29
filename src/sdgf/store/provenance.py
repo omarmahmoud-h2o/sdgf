@@ -69,6 +69,7 @@ class ToolTraceEntry:
     result: Any = None
     sensitivity: str | None = None
     cached: bool = False
+    error: str | None = None  # set when the gateway denied or the tool failed; no result
 
 
 @dataclass(frozen=True)

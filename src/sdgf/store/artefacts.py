@@ -202,6 +202,10 @@ class ArtefactStore:
     def read_shared(self, spec_version: str, stage: str) -> Any:
         return _read_artefact(self._shared_path(spec_version, stage), spec_version)
 
+    def shared_jsonl_path(self, spec_version: str, name: str) -> Path:
+        """A shared record stream (e.g. the tool-response cache) reused across runs."""
+        return self._version_dir(spec_version) / "shared" / f"{_check_name('stream', name)}.jsonl"
+
     def open_run(self, spec_version: str, run_id: str | None = None) -> RunDir:
         """Create a new run, or resume `run_id` if it already exists for this spec_version."""
         vdir = self._version_dir(spec_version)
