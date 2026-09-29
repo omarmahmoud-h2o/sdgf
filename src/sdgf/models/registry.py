@@ -145,8 +145,20 @@ def _mock_factory(config: ModelConfig) -> ModelBackend:
     )
 
 
+def _register_builtins(registry: ModelRegistry) -> None:
+    # The real backends import their SDKs only at setup(), so registering them is free.
+    # There is deliberately no default backend: models.<stage>.backend picks one (§12.2).
+    from sdgf.models import anthropic, mlx, openai_compat, vllm
+
+    registry.register("mock", _mock_factory)
+    registry.register(openai_compat.OpenAICompatBackend.name, openai_compat.factory)
+    registry.register(anthropic.AnthropicBackend.name, anthropic.factory)
+    registry.register(vllm.VLLMBackend.name, vllm.factory)
+    registry.register(mlx.MLXBackend.name, mlx.factory)
+
+
 REGISTRY = ModelRegistry()
-REGISTRY.register("mock", _mock_factory)
+_register_builtins(REGISTRY)
 
 
 def build_models(
