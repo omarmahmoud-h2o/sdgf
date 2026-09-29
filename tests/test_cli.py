@@ -113,6 +113,9 @@ def test_run_fills_every_cell_and_saves_its_options(fag, tmp_path):
     assert code == EXIT_OK, out
     assert out["complete"] and out["accepted"] == int(TARGET) and out["run_id"] == "r1"
     assert out["layers"] == NO_JUDGE[1:]  # the plugin's judge is ignored, not an error
+    # usage and cost per accepted record; FAG prices its local generator at 0
+    assert out["usage"]["calls"] >= int(TARGET) and out["usage"]["tokens"] > 0
+    assert out["cost_per_accepted"] == 0.0
     run = ArtefactStore(tmp_path).open_run(fag.spec_version, "r1")
     assert run.read_stage(OPTIONS_STAGE)["target_size"] == int(TARGET)
     assert [m["stage"] for m in run.read_stage("spec")["models"]] == ["generator"]

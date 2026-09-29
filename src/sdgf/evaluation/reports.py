@@ -223,6 +223,26 @@ def dataset_card(
         out += ["", "Waived (unmeasured, not failed): " + ", ".join(gate.waived)]
     out += [
         "",
+        "## Cost",
+        "",
+        f"- Tokens per released record: {_fmt(overall.tokens_per_record)}",
+        f"- Estimated cost per released record (USD): {_fmt(overall.cost_per_record)}",
+        f"- Seconds per released record: {_fmt(overall.seconds_per_record)}",
+    ]
+    if overall.usage_by_stage:
+        out += [
+            "",
+            "| stage | calls | tokens | estimated calls | cost (USD) | cost per record |",
+            "|---|---|---|---|---|---|",
+        ]
+        for stage, u in sorted(overall.usage_by_stage.items()):
+            out.append(
+                f"| {stage} | {u.get('calls')} | {u.get('tokens')} | "
+                f"{u.get('estimated_calls')} | {_fmt(u.get('cost_usd'))} | "
+                f"{_fmt(u.get('cost_per_record'))} |"
+            )
+    out += [
+        "",
         "## Governance",
         "",
         f"- Violations in the released set: {_fmt(governance['violations'])}",

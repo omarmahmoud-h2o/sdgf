@@ -14,7 +14,8 @@
                       label but the human didn't (1 - per-label precision), averaged
     governance        released records the governance scanners still flag (L3 re-run)
     overlap           maximum similarity of any accepted record to a seed or held-out item
-    cost              tokens, dollars and seconds ÷ accepted records (overall only)
+    cost              tokens, dollars and seconds ÷ accepted records, overall and per model
+                      stage (overall only), from the run's usage ledger (usage.json)
     yield             accepted ÷ candidates generated
 
 Metrics nothing measured are None, never 0, so the gate can tell "not measured" from
@@ -46,6 +47,7 @@ from sdgf.evaluation.diversity import (
 )
 from sdgf.generate.scheduler import Cell
 from sdgf.judge.calibration import CalibrationResult
+from sdgf.models.usage import USAGE_STAGE
 from sdgf.store.provenance import PROVENANCE_KEY
 from sdgf.validate.base import Layer, ValidationContext
 from sdgf.validate.l3_governance import TOOL_TRACE_KEY
@@ -163,6 +165,8 @@ class Metrics:
     tokens_per_record: float | None = None
     cost_per_record: float | None = None
     seconds_per_record: float | None = None
+    # stage -> calls, tokens, cost_usd (None if unpriced), plus the per-record figures
+    usage_by_stage: dict[str, dict[str, Any]] = field(default_factory=dict)
     yield_: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -270,6 +274,7 @@ def compute_metrics(
     governance: Layer | None = None,
     overlap: OverlapLayer | None = None,
     usage: Mapping[str, float] | None = None,
+    usage_by_stage: Mapping[str, Mapping[str, Any]] | None = None,
     embed: Embedder | None = None,
     k: int = 8,
     seed: int = 0,
@@ -281,7 +286,8 @@ def compute_metrics(
     cells are the run's cells and quotas; balance the target shares per axis (without
     it, the planned label shares from the quotas, when cells carry a label). governance
     and overlap are the L3 and L4 layers to re-run on the released set; usage is the
-    scheduler's usage snapshot (tokens, cost_usd, seconds)."""
+    run's usage totals (tokens, cost_usd, seconds) and usage_by_stage the same per model
+    stage (models/usage.StageUsage.to_dict())."""
     drops = [_drop_dict(d) for d in drops]
     cells = list(cells or ())
     quotas = {c.id: c.quota for c in cells}
@@ -380,6 +386,14 @@ def compute_metrics(
         "tokens_per_record": _per(usage.get("tokens"), n),
         "cost_per_record": _per(usage.get("cost_usd"), n),
         "seconds_per_record": _per(usage.get("seconds"), n),
+        "usage_by_stage": {
+            stage: dict(u)
+            | {
+                "tokens_per_record": _per(u.get("tokens"), n),
+                "cost_per_record": _per(u.get("cost_usd"), n),
+            }
+            for stage, u in sorted((usage_by_stage or {}).items())
+        },
     }
     if cells:
         fills = [per_cell[c].fill for c in quotas]
@@ -413,12 +427,17 @@ def metrics_for_run(
     max_hypotheses: int | None = None,
 ) -> MetricsReport:
     """compute_metrics over a pipeline run's artefacts: accepted.jsonl, drops.jsonl,
-    cells.json and (for usage, unless passed) summary.json. L3 and L4 are rebuilt from
-    the spec; the held-out check runs only when held_out_paths is passed."""
+    cells.json and, for usage unless passed, the usage ledger (usage.json, every
+    invocation of the run) or else summary.json. L3 and L4 are rebuilt from the spec; the
+    held-out check runs only when held_out_paths is passed."""
     from sdgf.validate.l3_governance import GovernanceLayer
 
     cells = [Cell(c["id"], dict(c["params"]), int(c["quota"])) for c in run.read_stage("cells")]
-    if usage is None and run.has_stage("summary"):
+    usage_by_stage = None
+    if usage is None and run.has_stage(USAGE_STAGE):
+        ledger = run.read_stage(USAGE_STAGE)
+        usage, usage_by_stage = ledger["total"], ledger["stages"]
+    elif usage is None and run.has_stage("summary"):
         usage = run.read_stage("summary").get("usage")
     overlap = (
         OverlapLayer.from_spec(compiled, held_out_paths=held_out_paths)
@@ -434,6 +453,7 @@ def metrics_for_run(
         governance=GovernanceLayer.from_spec(compiled),
         overlap=overlap,
         usage=usage,
+        usage_by_stage=usage_by_stage,
         embed=embed,
         k=k,
         seed=seed,

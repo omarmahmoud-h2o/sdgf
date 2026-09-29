@@ -308,13 +308,16 @@ coverage:
 
 models:
   # A local vLLM server by default. Tests replace every stage with MockBackend via
-  # registry overrides, and never call a real model.
+  # registry overrides, and never call a real model. Local models have no API cost, so
+  # they are priced at 0 per million tokens; a provider model sets its own price here.
   generator:
     backend: openai_compat
     model: Qwen3.5-4B
     hosting: local
     temperature: 0.8
     max_tokens: 4096
+    input_cost_per_mtok: 0.0
+    output_cost_per_mtok: 0.0
     params:
       api_base: http://localhost:8001/v1
       api_key_env: VLLM_API_KEY
@@ -327,6 +330,8 @@ models:
     hosting: local
     temperature: 0.0
     max_tokens: 512
+    input_cost_per_mtok: 0.0
+    output_cost_per_mtok: 0.0
     params:
       api_base: http://localhost:8001/v1
       api_key_env: VLLM_API_KEY

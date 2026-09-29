@@ -267,7 +267,17 @@ class ModelConfig(_Section):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, gt=0)
     concurrency: int = Field(default=1, ge=1)
+    # Estimated price in USD per million tokens, for cost tracking (models/usage.py).
+    # Both or neither; unset means the stage is unpriced, not free.
+    input_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    output_cost_per_mtok: float | None = Field(default=None, ge=0.0)
     params: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _both_prices(self) -> ModelConfig:
+        if (self.input_cost_per_mtok is None) != (self.output_cost_per_mtok is None):
+            raise ValueError("set both input_cost_per_mtok and output_cost_per_mtok, or neither")
+        return self
 
 
 class ModelsSection(_Section):

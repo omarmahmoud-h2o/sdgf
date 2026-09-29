@@ -201,7 +201,14 @@ def _run_report(result: RunResult) -> dict[str, Any]:
         "layers": list(result.layers),
         "skipped_layers": list(result.skipped_layers),
         "drops_by_layer": result.drops.by_layer(),
+        "usage": result.usage.get("total"),
+        "cost_per_accepted": _per_record(result.usage.get("total", {}).get("cost_usd"), result),
     }
+
+
+def _per_record(total: float | None, result: RunResult) -> float | None:
+    n = sum(result.counts.values())
+    return None if total is None or not n else total / n
 
 
 def _parse_label(text: str) -> Any:

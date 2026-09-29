@@ -23,7 +23,10 @@ or a per target and plan seed file). The expansion model is built, and so named 
 D12 endpoint record, only when an axis needs keywords and no plan is cached yet.
     accepted.jsonl accepted records, post_processed, with provenance under _provenance
     drops.jsonl    every dropped candidate with cell, layer, codes and reason
-    summary.json   the scheduler snapshot and drop counts at the end of the run
+    summary.json   the scheduler snapshot, this invocation's usage per stage and drop counts
+    usage.json     the usage ledger: calls, tokens and estimated cost per model stage and
+                   seconds, summed over every invocation of the run; rewritten after each
+                   wave, so a killed run keeps its count; stage 4 cost per record reads it
     review.jsonl   records L5 queued for people, when hitl.review_flagged and no sink is given;
                    hitl/queue.ReviewQueue.for_run() resolves them into review_decisions.jsonl
     rounds.json    Pipeline.release(): per round, the cells run, the gate outcome, short cells
@@ -56,6 +59,15 @@ answers in call order, so it is only order-independent as a callable of the prom
 with tools, a trace entry's cached flag records whether a call was served from the cache,
 which depends on timing.
 
+Budgets and cost: every stage's backend is metered (models/usage.py), tokens from the
+backend response or estimated from text length, cost from models.<stage> prices. Each
+slot's usage is charged to the scheduler as it settles, and a wave holds only as many
+slots as the remaining token, cost and time budget covers at the average usage per slot
+so far (Scheduler.wave_allowance, one slot before any has settled), so spec.budget stops
+the run cleanly between waves, overshooting by at most what that estimate missed. A budget stop is resumable: rerunning the run id continues
+from what was accepted, with the budget applying afresh to that invocation, while
+usage.json keeps the run's total. Release rounds within one invocation share a budget.
+
 L5 (judge) and L6 (consistency) build the judge stage, and the fallback judge only when
 the rubric may ask for reasons, so the D12 endpoint record names only models that get
 data. The judge counts as trusted when a calibration result for this spec_version and
@@ -70,6 +82,7 @@ import json
 import logging
 import random
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
@@ -92,6 +105,7 @@ from sdgf.judge.llm_judge import LLMJudge
 from sdgf.generate.scheduler import Cell, Scheduler
 from sdgf.models.base import BoundedBackend, ModelBackend
 from sdgf.models.registry import StageModels, build_models
+from sdgf.models.usage import USAGE_STAGE, MeteredBackend, Pricing, UsageLedger, UsageMeter
 from sdgf.spec.compile import CompiledSpec, compile_spec
 from sdgf.store.artefacts import ArtefactStore, JsonlWriter, RunDir
 from sdgf.store.provenance import PROVENANCE_KEY, ProvenanceBuilder, attach
@@ -202,6 +216,7 @@ class Slot:
     reason: str
     drops: list[Drop]
     reviews: list[ReviewItem]
+    usage: UsageLedger = field(default_factory=UsageLedger)
     attempts: int = 0
     history: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
@@ -216,6 +231,7 @@ class RunResult:
     layers: tuple[str, ...]
     skipped_layers: tuple[str, ...]
     snapshot: dict[str, Any] = field(default_factory=dict)
+    usage: dict[str, Any] = field(default_factory=dict)  # the run's usage ledger, as in usage.json
 
     @property
     def complete(self) -> bool:
@@ -313,6 +329,20 @@ class Pipeline:
             }
         )
         self.models: StageModels = build_models(spec_models, overrides)
+        # Every stage is metered; stage prices come from models.<stage>, overridden or not.
+        pricing = {st: Pricing.from_config(getattr(spec_models, st)) for st in self.used_stages}
+        if self.compiled.spec.budget.max_cost_usd is not None:
+            unpriced = [st for st, p in pricing.items() if p is None]
+            if unpriced:
+                raise PipelineError(
+                    f"budget.max_cost_usd is set but models {unpriced} have no price; set "
+                    "input_cost_per_mtok and output_cost_per_mtok (0 for a free model)"
+                )
+        self.meter = UsageMeter()
+        self._metered: dict[str, ModelBackend] = {
+            st: MeteredBackend(self.models.backend(st), st, self.meter, pricing[st])
+            for st in self.used_stages
+        }
         # Concurrency: one pool sized for the busiest stage, each stage's backend capped
         # at its own models.<stage>.concurrency. One worker runs the slots inline.
         limits = {
@@ -322,9 +352,7 @@ class Pipeline:
         }
         self.workers = max(limits.values())
         self._bounded: dict[str, ModelBackend] = {
-            st: BoundedBackend(self.models.backend(st), n)
-            if self.workers > 1
-            else self.models.backend(st)
+            st: BoundedBackend(self._metered[st], n) if self.workers > 1 else self._metered[st]
             for st, n in limits.items()
         }
         # Tools: the task's allowlist behind one gateway, with the spec_version's shared
@@ -455,7 +483,7 @@ class Pipeline:
 
     def plan(self) -> CoveragePlan:
         """Stage 1: the shared coverage plan for this spec_version, built once if absent."""
-        backend = self.models.backend("expansion") if "expansion" in self.used_stages else None
+        backend = self._metered.get("expansion")
         plan, _ = load_or_build_plan(
             self.store,
             self.compiled,
@@ -514,6 +542,11 @@ class Pipeline:
                 cost_usd=float(prior_usage.get("cost_usd", 0.0)),
                 seconds=float(prior_usage.get("seconds", 0.0)),
             )
+        started = time.monotonic()
+        base = run.read_stage(USAGE_STAGE) if run.has_stage(USAGE_STAGE) else None
+        ledger = UsageLedger()
+        # usage outside any slot, e.g. stage 1 keyword expansion building the plan
+        self._charge(scheduler, ledger, self.meter.take_loose())
         prior = run.read_jsonl(ACCEPTED_STREAM)
         prior_accepted = Counter(r[PROVENANCE_KEY]["cell_id"] for r in prior)
         if self.overlap is not None:
@@ -539,7 +572,10 @@ class Pipeline:
                 streams.callback(pool.shutdown, cancel_futures=True)
             while True:
                 wave: list[tuple[Cell, int]] = []
-                while (cell := scheduler.next_cell()) is not None:
+                limit = scheduler.wave_allowance()
+                while (limit is None or len(wave) < limit) and (
+                    cell := scheduler.next_cell()
+                ) is not None:
                     wave.append((cell, candidate_seed(self.seed, cell.id, tried[cell.id])))
                     tried[cell.id] += 1
                 if not wave:
@@ -550,14 +586,18 @@ class Pipeline:
 
                 # map keeps reservation order; without a pool each slot runs as it settles
                 for slot in pool.map(one, wave) if pool is not None else map(one, wave):
+                    self._charge(scheduler, ledger, slot.usage)
                     record = self._settle(slot, scheduler, drops)
                     if record is not None:
                         out.write(record)
                         accepted.append(record)
                 if self.overlap is not None:
                     self.overlap.commit_staged()
+                write_usage(run, base, ledger, time.monotonic() - started)
 
+        usage = write_usage(run, base, ledger, time.monotonic() - started)
         snapshot = scheduler.snapshot()
+        snapshot["usage_by_stage"] = ledger.to_dict()
         snapshot["drops"] = {"by_layer": drops.by_layer(), "by_code": drops.by_code()}
         snapshot["skipped_layers"] = list(self.skipped_layers)
         snapshot["only"] = None if only is None else [c.id for c in scheduled]
@@ -571,6 +611,7 @@ class Pipeline:
             layers=self.layers,
             skipped_layers=self.skipped_layers,
             snapshot=snapshot,
+            usage=usage,
         )
 
     def release(
@@ -601,13 +642,13 @@ class Pipeline:
             result = self.run(run_id, only=only, prior_usage=usage)
             run, run_id = result.run, result.run.run_id
             usage = result.snapshot["usage"]
-            # Stage 4: every §8 metric over the whole run, not just this round's records.
+            # Stage 4: every §8 metric over the whole run, not just this round's records;
+            # cost per record from the run's usage ledger, every invocation included.
             metrics = metrics_for_run(
                 self.compiled,
                 run,
                 calibration=self.calibration,
                 held_out_paths=self.held_out_paths,
-                usage=usage,
                 embed=embed,
                 seed=self.seed,
             )
@@ -658,6 +699,11 @@ class Pipeline:
             return "max_rounds"
         return None
 
+    @staticmethod
+    def _charge(scheduler: Scheduler, ledger: UsageLedger, usage: UsageLedger) -> None:
+        scheduler.charge(tokens=usage.tokens, cost_usd=usage.cost_usd or 0.0)
+        ledger.add(usage)
+
     def _settle(self, slot: Slot, scheduler: Scheduler, drops: DropLog) -> dict[str, Any] | None:
         """Settle one slot in reservation order; returns the record if it is accepted."""
         record = slot.record
@@ -698,7 +744,8 @@ class Pipeline:
         local = _HeldDrops()
         with ExitStack() as stack:
             reviews = stack.enter_context(self.reviews.capture()) if self.reviews else []
-            slot = Slot(cell, None, "", local.drops, reviews)
+            usage = stack.enter_context(self.meter.capture())
+            slot = Slot(cell, None, "", local.drops, reviews, usage)
             recipe = self.generator.recipe(cell.params, random.Random(seed))
             if recipe is None:
                 local.drops.append(
@@ -735,6 +782,32 @@ class Pipeline:
             # A JSON round trip makes the returned record identical to the stored line.
             slot.record = json.loads(json.dumps(attach(record, provenance)))
             return slot
+
+
+def write_usage(
+    run: RunDir, base: Mapping[str, Any] | None, ledger: UsageLedger, seconds: float
+) -> dict[str, Any]:
+    """Write the run's usage ledger: base (earlier invocations) plus this invocation."""
+    stages = UsageLedger.from_dict(base["stages"]) if base else UsageLedger()
+    stages.add(ledger)
+    seconds += float(base["seconds"]) if base else 0.0
+    total = stages.total()
+    data = {
+        "invocations": (int(base["invocations"]) if base else 0) + 1,
+        "seconds": seconds,
+        "stages": stages.to_dict(),
+        "total": {
+            "calls": total.calls,
+            "input_tokens": total.input_tokens,
+            "output_tokens": total.output_tokens,
+            "tokens": total.tokens,
+            "estimated_calls": total.estimated_calls,
+            "cost_usd": total.cost_usd,
+            "seconds": seconds,
+        },
+    }
+    run.write_stage(USAGE_STAGE, data)
+    return data
 
 
 class _HeldDrops(DropLog):

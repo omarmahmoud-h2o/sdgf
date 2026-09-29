@@ -19,6 +19,11 @@ only accepts count, the final per-cell counts equal the quotas whatever gets dro
 broken by the larger absolute deficit and then by plan order. Fill fraction rather than
 raw deficit keeps partially filled runs proportional to the plan, so a budget stop
 leaves the distribution as close to the target as possible.
+
+Token, cost and time are charged when a candidate settles, so a caller that reserves
+many slots at once (a wave) asks wave_allowance() first: how many slots the remaining
+budget covers at the average usage per settled candidate so far, and 1 before any has
+settled. The allowance depends only on charged usage, not on how many workers run it.
 """
 
 from __future__ import annotations
@@ -102,7 +107,11 @@ class Scheduler:
         self.usage = Usage()
         self._clock = clock
         self._started = clock()
+        self._created = self._started
         self.stop_reason: str | None = None
+        # usage charged since this scheduler was created, for per-candidate averages
+        self._charged = Usage()
+        self._settled = 0
 
     # ── picking ──────────────────────────────────────────────────
 
@@ -161,6 +170,7 @@ class Scheduler:
         if st.in_flight <= 0:
             raise SchedulerError(f"cell {cell_id!r} has no reservation to settle")
         st.in_flight -= 1
+        self._settled += 1
         return st
 
     # ── budget ───────────────────────────────────────────────────
@@ -170,6 +180,30 @@ class Scheduler:
             raise SchedulerError("charges must be non-negative")
         self.usage.tokens += tokens
         self.usage.cost_usd += cost_usd
+        self._charged.tokens += tokens
+        self._charged.cost_usd += cost_usd
+
+    def wave_allowance(self) -> int | None:
+        """Slots the remaining token, cost and time budget covers; None if it sets none."""
+        b = self.budget
+        per = self._settled
+        spent = [
+            (b.max_tokens, self.usage.tokens, self._charged.tokens),
+            (b.max_cost_usd, self.usage.cost_usd, self._charged.cost_usd),
+            (b.max_seconds, self.elapsed(), self._clock() - self._created),
+        ]
+        spent = [(limit, used, charged) for limit, used, charged in spent if limit is not None]
+        if not spent:
+            return None
+        if not per:
+            return 1  # nothing to average yet: probe with one candidate
+        allowance: int | None = None
+        for limit, used, charged in spent:
+            if charged <= 0:
+                continue  # e.g. a free model: this budget can't run out
+            n = int((limit - used) / (charged / per))
+            allowance = n if allowance is None else min(allowance, n)
+        return None if allowance is None else max(1, allowance)
 
     def elapsed(self) -> float:
         return self._clock() - self._started
