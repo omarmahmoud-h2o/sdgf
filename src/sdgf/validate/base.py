@@ -62,6 +62,12 @@ class ValidationContext:
     recipe: Mapping[str, Any] = field(default_factory=dict)
     attempt: int = 0  # 0 is the first generation, n is the n-th repair
     extra: Mapping[str, Any] = field(default_factory=dict)
+    # Verdicts of the layers that already ran on this record, filled by the cascade,
+    # so a later layer can read an earlier one's details (L6 reads L5's).
+    previous: tuple[LayerVerdict, ...] = ()
+
+    def verdict_of(self, layer: str) -> LayerVerdict | None:
+        return next((v for v in self.previous if v.layer == layer), None)
 
 
 @dataclass(frozen=True)

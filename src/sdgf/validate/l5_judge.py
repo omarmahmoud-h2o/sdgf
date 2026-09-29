@@ -42,6 +42,30 @@ LABEL_FIELD = "label"
 HARD_DIFFICULTY = "hard"
 
 
+def verdict_means(labels: Mapping[str, Any], verdict: str, label: Any) -> bool:
+    """Whether a judge verdict means the intended label under rubric.verdict.labels."""
+    if verdict not in labels:
+        return False
+    meant = labels[verdict]
+    # True == 1 in Python; a bool label only agrees with a bool, and vice versa.
+    if isinstance(meant, bool) or isinstance(label, bool):
+        return type(meant) is type(label) and meant == label
+    return meant == label
+
+
+def escalates(
+    rules: EscalationRules, record: Record, context: ValidationContext, low: bool
+) -> bool:
+    """Low confidence, a hard cell or a contestable record, per validation.escalation."""
+
+    def fact(name: str) -> Any:
+        return context.recipe.get(name, record.get(name))
+
+    hard = str(fact("difficulty") or "").casefold() == HARD_DIFFICULTY
+    contestable = fact("contestable") is True
+    return low or (rules.on_hard_cells and hard) or (rules.on_contestable and contestable)
+
+
 @dataclass(frozen=True)
 class ReviewItem:
     """A record routed to people instead of being accepted, repaired or dropped."""
@@ -150,28 +174,13 @@ class JudgeLayer(Layer):
     # ── helpers ──────────────────────────────────────────────────
 
     def agrees(self, verdict: str, label: Any) -> bool:
-        if verdict not in self.labels:
-            return False
-        meant = self.labels[verdict]
-        # True == 1 in Python; a bool label only agrees with a bool, and vice versa.
-        if isinstance(meant, bool) or isinstance(label, bool):
-            return type(meant) is type(label) and meant == label
-        return meant == label
+        return verdict_means(self.labels, verdict, label)
 
     def verdicts_for(self, label: Any) -> list[str]:
         return [v for v in self.schema.verdict_values if self.agrees(v, label)]
 
     def _escalate(self, record: Record, context: ValidationContext, low: bool) -> bool:
-        def fact(name: str) -> Any:
-            return context.recipe.get(name, record.get(name))
-
-        hard = str(fact("difficulty") or "").casefold() == HARD_DIFFICULTY
-        contestable = fact("contestable") is True
-        return (
-            low
-            or (self.escalation.on_hard_cells and hard)
-            or (self.escalation.on_contestable and contestable)
-        )
+        return escalates(self.escalation, record, context, low)
 
     def _reason(self, view: Record, result: JudgeResult, flagged: bool) -> str | None:
         if self.reasoner is None or not self.schema.needs_reason(flagged):

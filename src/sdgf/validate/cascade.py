@@ -5,12 +5,14 @@ and the cascade stops at the first layer that does not pass, so the paid judge l
 never see a record a free layer already rejected. The result says which layer failed
 and whether the failure is repairable, which is all repair and the drop log need.
 
+Each layer sees the verdicts of the layers before it in context.previous.
+
 A layer that raises is a pipeline bug, not a bad record, so the exception propagates.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Mapping, Sequence
 
 from sdgf.spec.schema import ALL_LAYERS, LayerName, ValidationSection
@@ -112,7 +114,7 @@ class Cascade:
         context = context or ValidationContext()
         verdicts: list[LayerVerdict] = []
         for layer in self.layers:
-            verdict = layer.check(record, context)
+            verdict = layer.check(record, replace(context, previous=tuple(verdicts)))
             if not isinstance(verdict, LayerVerdict):
                 raise CascadeError(f"layer {layer.name} returned {type(verdict).__name__}")
             if verdict.layer != layer.name:
