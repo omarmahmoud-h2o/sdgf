@@ -265,11 +265,54 @@ class EscalationRules(_Section):
     on_contestable: bool = True
 
 
+class KeywordRule(_Section):
+    """An L2 required/forbidden keyword rule over record text.
+
+    Text scanned: message contents (only those whose role is in `roles`, if given) plus
+    the top-level string fields named in `fields`. `when` restricts the rule to records
+    whose fields equal the given values (a list value means "one of").
+    """
+
+    name: str = Field(min_length=1)
+    kind: Literal["required", "forbidden"]
+    keywords: list[str] = Field(min_length=1)
+    match: Literal["substring", "word", "regex"] = "word"
+    case_sensitive: bool = False
+    require: Literal["any", "all"] = "any"  # required rules only
+    roles: list[str] | None = None
+    fields: list[str] = Field(default_factory=list)
+    when: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check(self) -> KeywordRule:
+        if any(not k for k in self.keywords):
+            raise ValueError("keywords must be non-empty strings")
+        if self.match == "regex":
+            for k in self.keywords:
+                try:
+                    re.compile(k)
+                except re.error as e:
+                    raise ValueError(f"keyword {k!r} is not a valid regex: {e}") from e
+        if self.kind == "forbidden" and self.require != "any":
+            raise ValueError("require applies to required rules only")
+        return self
+
+
 class ValidationSection(_Section):
     layers: list[LayerName] = Field(default_factory=lambda: list(ALL_LAYERS), min_length=1)
     repair_tries: int = Field(default=2, ge=0)
     consistency_k: int = Field(default=5, ge=1)
     escalation: EscalationRules = Field(default_factory=EscalationRules)
+    rules: list[KeywordRule] = Field(default_factory=list)
+
+    @field_validator("rules")
+    @classmethod
+    def _unique_rules(cls, v: list[KeywordRule]) -> list[KeywordRule]:
+        names = [r.name for r in v]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(f"duplicate rule names: {dupes}")
+        return v
 
     @field_validator("layers")
     @classmethod
