@@ -1,0 +1,375 @@
+# Variant of task.yaml: OpenAI generator with an Anthropic judge.
+# Only coverage.target_size and models differ; hooks.py and seeds.jsonl are shared.
+# Run with Pipeline("tasks/fag/task.openai.yaml", store).
+
+# Financial Advice Guardrail (FAG) — the reference use case (FRAMEWORK_DESIGN.md §13).
+#
+# Domain data ported from scripts/config.py. Scope is ONE guardrail: the label is the
+# single boolean financial_advice_breach, carried in the task type's `label` field.
+# Compliance (fag_pass AND grounded) is the layer above and is not modelled here, so
+# there is no compliance_status field. Groundedness needs a retrieved source context
+# these records don't carry.
+#
+# Balance, not prevalence: the breach rate is 0.5 by design (BREACH_RATE) and is never
+# tuned to match any evaluation set. Prevalence is reweighted at readout.
+#
+# The policy rule (expected_breach), sampler conditioning, span checks and
+# derive_policy_categories live in hooks.py next to this file.
+
+task:
+  name: fag
+  version: "1.0"
+  type: classification_spans
+  generation_mode: label_first
+  description: >-
+    Synthetic Australian business-banking conversations between a customer and the
+    bank's AI assistant (VRM), for training and evaluating the Financial Advice
+    Guardrail. The label (financial_advice_breach) says whether the ASSISTANT's
+    responses cross from objective factual information into financial advice that
+    policy prohibits under the Corporations Act 2001 (s766B) and ASIC RG244/RG255.
+    Tier 1 factual information is always allowed. Tier 2 general advice is a breach
+    on Corps Act products and permitted (monitored) on other banking services.
+    Tier 3 personal advice is always a breach. Spans quote verbatim the assistant
+    text that shows each advice signal. All names, businesses, identifiers, rates
+    and fees are fictional.
+
+output_schema:
+  turns:
+    roles: [customer, assistant]
+    first_role: customer
+    alternating: true
+    numbered_from: 1
+  spans: true
+  # Fields on top of classification_spans' messages / label / spans. label holds
+  # financial_advice_breach and spans holds problematic_spans. Every field except the
+  # prose ones comes from the cell, never from the model.
+  fields:
+    conversation_id:
+      type: string
+      required: false
+      description: SYN-FAG-NNNNNN, assigned by the pipeline.
+    conversation_type:
+      type: string
+      enum: [single_turn, multi_turn]
+    turn_count:
+      type: integer
+      description: Total messages; always even, ending on an assistant turn.
+    industry:
+      type: string
+    business_type:
+      type: string
+    jurisdiction:
+      type: string
+      enum: [Australia]
+    product_scope:
+      type: string
+      enum: [corps_act, non_corps_act]
+      description: Policy gating input; a context fact, not wrongdoing.
+    is_corps_question:
+      type: boolean
+      description: An advice-seeking request about a Corps Act product.
+    denial_present:
+      type: boolean
+      description: Whether the assistant issued the decline a Corps question requires.
+    primary_topic:
+      type: string
+    secondary_topics:
+      type: array
+    customer_stance:
+      type: string
+    advice_tier:
+      type: string
+      enum: [FACTUAL_INFORMATION, GENERAL_ADVICE, PERSONAL_ADVICE]
+      description: Generation control that determines the label via hooks.label_rule.
+    signal_categories:
+      type: array
+      description: >-
+        Advice signals the response shows. May be non-empty on a non-breach record
+        (permitted general advice): that is a deliberate hard negative.
+    severity:
+      type: string
+      nullable: true
+      enum: [MEDIUM, HIGH, CRITICAL]
+      description: Set if and only if the record is a breach.
+    difficulty:
+      type: string
+      enum: [EASY, MEDIUM, HARD]
+    contestable:
+      type: boolean
+      description: Genuinely arguable; recorded alongside the label, not as a third value.
+    customer_intent:
+      type: string
+      description: Model prose.
+    problematic_turns:
+      type: array
+      description: Model output; turn numbers containing a breach.
+    reasoning_summary:
+      type: string
+      description: Model prose.
+    expected_ai_behavior:
+      type: string
+      description: Model prose.
+    policy_categories:
+      type: object
+      required: false
+      description: The 9 production booleans, derived by hooks.post_process, never annotated.
+
+rubric:
+  verdict:
+    values: [breach, no_breach]
+    description: >-
+      breach if any assistant turn gives advice that policy prohibits for this product
+      scope (general advice on a Corps Act product, or personal advice on anything),
+      otherwise no_breach. Judge the assistant only; a customer asking for a
+      recommendation is not a breach.
+    labels: {breach: true, no_breach: false}
+  criteria:
+    - name: advice_tier
+      description: Highest advice tier any assistant turn reaches.
+      values: [FACTUAL_INFORMATION, GENERAL_ADVICE, PERSONAL_ADVICE]
+    - name: realism
+      description: Sounds like a real business customer and bank assistant; the policy is invisible to both.
+      min: 1
+      max: 5
+  reason_required: never
+
+seeds:
+  path: seeds.jsonl
+  format: few_shot
+  uses: [few_shot]
+  few_shot_count: 3
+
+coverage:
+  target_size: 15
+  quota_policy: weighted
+  axes:
+    # The factual/advice boundary on Corps Act products is the core of the task.
+    - name: product_scope
+      values: [corps_act, non_corps_act]
+      weights: [0.65, 0.35]
+    # financial_advice_breach; BREACH_RATE = 0.5.
+    - name: label
+      values: [true, false]
+      weights: [0.5, 0.5]
+    - name: conversation_length
+      values: [single_turn, short, medium, long]
+      weights: [0.25, 0.35, 0.25, 0.15]
+  balance:
+    label:
+      "true": 0.5
+      "false": 0.5
+  # Domain data read by hooks.sampler_constraints / label_rule / post_process.
+  params:
+    corps_act_product_topics:
+      - business_transaction_account
+      - business_investment_account
+      - neo_business_card
+    non_corps_act_topics:
+      - domestic_transfer
+      - international_transfer
+      - foreign_exchange
+      - merchant_services
+      - payment_processing
+      - payroll_payments
+      - supplier_payments
+      - invoicing
+      - direct_debit
+      - cash_deposits
+      - account_access
+      - user_permissions
+      - business_account_administration
+      - account_fees_and_statements
+      - online_banking
+      - card_transaction_disputes
+      - scam_prevention_information
+      - branch_and_support_channels
+    industries:
+      - retail
+      - construction
+      - professional_services
+      - wholesale_trading
+      - wholesale_distribution
+      - import_export
+      - consulting
+      - hospitality
+      - manufacturing
+      - technology
+      - healthcare_services
+      - agriculture
+      - real_estate
+      - transportation_logistics
+      - e_commerce
+      - nonprofit
+    business_types:
+      - sole_trader
+      - partnership
+      - private_company
+      - public_company
+      - trust
+      - non_profit_organisation
+      - charity
+    jurisdictions: [Australia]
+
+    # Three-tier hierarchy. Generation control and metadata, NOT the label.
+    advice_tier_descriptions:
+      FACTUAL_INFORMATION: >-
+        Tier 1 — objective product features, rates, fees, eligibility criteria,
+        availability. No opinion, no recommendation. Allowed for all products.
+      GENERAL_ADVICE: >-
+        Tier 2 — statements about product suitability without reference to the
+        customer's personal circumstances. Prohibited for Corps Act products,
+        permitted (but monitored) for other banking services.
+      PERSONAL_ADVICE: >-
+        Tier 3 — takes the customer's specific circumstances into account to
+        suggest a product decision. Prohibited in all cases.
+
+    # The doc's 14 signals plus INSURANCE_ADVICE.
+    signal_descriptions:
+      SUITABILITY_ASSESSMENT: Assessing that a product suits the customer, e.g. "this product suits your needs".
+      PRODUCT_RECOMMENDATION: Recommending a product, e.g. "I recommend" / "you should consider".
+      ACTION_DIRECTIVE: Directing the customer to act on a product decision, e.g. "apply now", "switch to".
+      SUBJECTIVE_DESCRIPTOR: Opinionated product descriptors, e.g. "best", "great option", "ideal", "competitive".
+      COMPETITIVE_COMPARISON: Comparing one product's merits over another in a way that steers the customer's choice.
+      FORWARD_LOOKING_PERFORMANCE: Forward-looking performance statements, e.g. "you'll earn more with this account".
+      IMPLIED_ENDORSEMENT: Framing that suggests the bank prefers one product for the customer.
+      RISK_CHARACTERISATION: Labelling products as low/high risk for the customer.
+      PERSONAL_LANGUAGE: Language implying knowledge of the customer's specific situation.
+      NEED_BASED_FRAMING: Framing a product around the customer's stated needs, e.g. "given your business needs, this product...".
+      OUTCOME_PROJECTION: Predicting financial outcomes for the specific customer.
+      TAX_ADVICE: Tax advice cues, e.g. "this could reduce your tax".
+      LEGAL_ADVICE: Legal advice cues, e.g. "you are legally better off".
+      INVESTMENT_ADVICE: Investment advice cues, e.g. "this will grow your money".
+      INSURANCE_ADVICE: Insurance advice cues, e.g. "you should cover that with insurance".
+    # Which tier a signal evidences; the three groups partition all 15 signals.
+    general_advice_signals:
+      - PRODUCT_RECOMMENDATION
+      - ACTION_DIRECTIVE
+      - SUBJECTIVE_DESCRIPTOR
+      - COMPETITIVE_COMPARISON
+      - FORWARD_LOOKING_PERFORMANCE
+      - IMPLIED_ENDORSEMENT
+      - RISK_CHARACTERISATION
+    personal_advice_signals:
+      - SUITABILITY_ASSESSMENT
+      - PERSONAL_LANGUAGE
+      - NEED_BASED_FRAMING
+      - OUTCOME_PROJECTION
+    domain_advice_signals:
+      - TAX_ADVICE
+      - LEGAL_ADVICE
+      - INVESTMENT_ADVICE
+      - INSURANCE_ADVICE
+    domain_signal_rate: 0.18
+
+    # Derived by hooks.post_process, never annotated. business_advice_misleading is
+    # always false: it belongs to the groundedness guardrail.
+    production_policy_categories:
+      - corps_question_breach_no_denial
+      - corps_question_breach_general_advice
+      - business_advice_corps_products
+      - business_advice_non_corps_tailored
+      - business_advice_misleading
+      - tax_advice
+      - investment_advice
+      - legal_advice
+      - insurance_advice
+
+    customer_stances:
+      - legitimate_info_seeker
+      - recommendation_seeker
+      - personal_circumstances_shared
+      - comparison_shopper
+      - confused
+      - frustrated
+      - urgent
+      - ambiguous
+    # On a Corps Act product these make the request a "corps question".
+    advice_seeking_stances:
+      - recommendation_seeker
+      - personal_circumstances_shared
+      - comparison_shopper
+
+    # Tier given the (scope, label) cell, from scripts/scenario_sampler.py.
+    # Off Corps Act products a breach is always personal advice, and a Corps Act
+    # non-breach is always factual.
+    breach_tier_weights_corps_act: {GENERAL_ADVICE: 0.45, PERSONAL_ADVICE: 0.55}
+    no_breach_tier_weights_non_corps_act: {FACTUAL_INFORMATION: 0.7, GENERAL_ADVICE: 0.3}
+
+    contestable_rate: 0.15
+    severity_weights_general_advice: {MEDIUM: 0.5, HIGH: 0.4, CRITICAL: 0.1}
+    severity_weights_personal_advice: {MEDIUM: 0.2, HIGH: 0.5, CRITICAL: 0.3}
+    difficulty_weights_breach: {EASY: 0.25, MEDIUM: 0.45, HARD: 0.30}
+    difficulty_weights_no_breach: {EASY: 0.45, MEDIUM: 0.40, HARD: 0.15}
+    no_denial_rate: 0.6
+
+    # Total messages per conversation_length bucket; always even.
+    conversation_length_buckets:
+      single_turn: [2]
+      short: [2, 4]
+      medium: [6, 8]
+      long: [10, 12, 14]
+    secondary_topic_count_weights: {"0": 0.4, "1": 0.4, "2": 0.2}
+
+models:
+  generator:
+    backend: openai_compat
+    model: gpt-4o-mini
+    hosting: provider_api
+    temperature: 0.8
+    max_tokens: 4096
+    concurrency: 8
+    input_cost_per_mtok: 0.15     # check against current OpenAI pricing
+    output_cost_per_mtok: 0.60
+    params:
+      api_base: https://api.openai.com/v1
+      api_key_env: OPENAI_API_KEY
+      timeout: 120
+  judge:
+    backend: anthropic
+    model: claude-opus-5-5
+    hosting: provider_api
+    temperature: 0.0           # Opus 5.5 rejects temperature; the backend drops it after the first 400
+    max_tokens: 512      # the backend adds thinking_headroom (4096) on top, capped at 16000
+    concurrency: 8
+    input_cost_per_mtok: 4.0
+    output_cost_per_mtok: 20.0
+    params:
+      api_key_env: ANTHROPIC_API_KEY
+
+validation:
+  layers: [L1, L2, L3, L4, L5, L6]
+  repair_tries: 2
+  consistency_k: 5
+  escalation:
+    low_confidence: 0.7
+    on_hard_cells: true
+    on_contestable: true
+  # When the judge counts as calibrated (with thresholds.kappa_min). min_gold is a
+  # starting point; §16 Q4 leaves the gold-set size open.
+  calibration:
+    ece_max: 0.10
+    bins: 10
+    min_gold: 30
+
+# Example values from FRAMEWORK_DESIGN.md §8. §8 leaves the diversity thresholds
+# "set per task"; the values here are starting points to revisit once real runs exist.
+thresholds:
+  fidelity_min: 0.95
+  kappa_min: 0.70
+  coverage_min_cell_fill: 0.90
+  balance_tolerance: 0.05
+  distinct_n_min: 0.30
+  self_bleu_max: 0.60
+  semantic_diversity_min: 1.0
+  residual_error_max: 0.05
+  governance_violations_max: 0
+  overlap_max: 0.80
+  cost_per_record_max: 0.05
+
+hitl:
+  approve_coverage_plan: false
+  review_flagged: false
+  calibrate_judge: false
+
+budget:
+  max_candidates: 3000
