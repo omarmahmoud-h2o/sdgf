@@ -6,6 +6,8 @@ means), an optional `hooks.py` (the task's checkable rules in code) and a `seeds
 The framework handles coverage planning, generation, the six-layer validation cascade,
 evaluation, the release gate and provenance. The design is in
 [../FRAMEWORK_DESIGN.md](../FRAMEWORK_DESIGN.md); section numbers (§) below refer to it.
+[docs/framework.md](docs/framework.md) explains the architecture, what each validation
+layer checks, and what a new use case needs.
 
 The first use case is the Financial Advice Guardrail (FAG), in [tasks/fag/](tasks/fag/),
 a `label_first` task: code fixes the label and the model writes matching text. The second,
