@@ -70,7 +70,9 @@ class AnthropicBackend(ModelBackend):
         try:
             resp = self.client.messages.create(**kwargs)
         except self._sdk.BadRequestError as e:
-            if not (self.supports_temperature and "temperature" in str(e)):
+            # Test this request's kwargs, not the flag: under concurrency another call
+            # may already have cleared it after sending its own temperature.
+            if not ("temperature" in kwargs and "temperature" in str(e)):
                 raise
             self.supports_temperature = False
             kwargs.pop("temperature")

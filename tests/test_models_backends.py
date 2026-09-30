@@ -2,7 +2,9 @@
 
 import json
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -257,6 +259,27 @@ def test_anthropic_drops_temperature_once_rejected(monkeypatch):
     assert b.call("p", 10, 0.7).text == "ok"
     assert b.call("p", 10, 0.7).text == "ok"
     assert ["temperature" in c for c in calls] == [True, False, False]
+
+
+def test_anthropic_temperature_retry_is_safe_under_concurrency(monkeypatch):
+    # Every call sends temperature before any rejection lands, as with concurrency > 1;
+    # a call rejected after another has already cleared the flag must still retry.
+    n = 4
+    sent = threading.Barrier(n)
+
+    def create(**kw):
+        if "temperature" in kw:
+            sent.wait(timeout=5)
+            raise FakeBadRequest("`temperature` is deprecated for this model.")
+        return SimpleNamespace(content=[block("text", text="ok")])
+
+    fake_anthropic(monkeypatch, create)
+    b = AnthropicBackend("claude-test")
+    b.setup()
+    with ThreadPoolExecutor(n) as pool:
+        texts = list(pool.map(lambda _: b.call("p", 10, 0.7).text, range(n)))
+    assert texts == ["ok"] * n
+    assert b.supports_temperature is False
 
 
 def test_anthropic_other_bad_request_propagates(monkeypatch):
