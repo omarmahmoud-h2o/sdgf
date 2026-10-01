@@ -219,7 +219,9 @@ go in the spec.
   from a temperature-0 judge don't just repeat L5's verdict. With L6 on and
   `consistency_k` above 1, stage 0 rejects a list whose every temperature is 0: one
   model at temperature 0 casts the same vote K times, at K times the cost. Use
-  `consistency_k: 1` for a single vote.
+  `consistency_k: 1` for a single vote. Each vote is kept with its stage, model and
+  temperature, in L6's `ballots` detail and in the record's provenance
+  (`layer_results[].ballots`), so vote agreement can be analysed after a run.
 - `escalation`: `low_confidence` (default 0.7), `on_hard_cells`, `on_contestable`, and
   `always` (default false; escalate every record, as CFA does for DS²-Instruct
   self-consistency). Escalated records go to L6. Under `answer_emergent`, L6's K answers

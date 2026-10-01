@@ -557,3 +557,118 @@ def test_pipeline_votes_on_the_consistency_judge_stage(fag, seeds, tmp_path):
         layers=["L6"],
     )
     assert alone.used_stages == ("generator", "consistency_judge")
+
+
+# ── per-vote provenance (details["ballots"], layer_results[].ballots) ──
+
+
+def test_label_first_ballots_name_each_votes_stage_model_and_temperature(fag, seeds):
+    seed = next(s for s in seeds if s["label"] is True)
+    spec = with_validation(fag, consistency_k=4)
+    backend = by_temperature({0.7: "breach", 0.8: "no_breach", 0.9: "breach"})
+    v = ConsistencyLayer.from_spec(spec, backend=backend).check(seed, escalated(seed))
+    assert v.details["ballots"] == [
+        {"stage": "judge", "model": "mock", "temperature": t, "vote": vote}
+        for t, vote in [(0.7, "breach"), (0.8, "no_breach"), (0.9, "breach"), (0.7, "breach")]
+    ]
+    assert [b["vote"] for b in v.details["ballots"]] == v.details["votes"]
+
+
+def test_ballots_follow_explicit_voters_and_record_abstentions():
+    a = LLMJudge(
+        schema(),
+        MockBackend(["not json"], cycle=True, model="voter-a"),
+        fields=FIELDS,
+        temperature=0.4,
+        parse_retries=0,
+        stage="consistency_judge",
+    )
+    b = VoteJudge(["yes", "yes"])  # a hand-built judge reports no stage, model or temperature
+    v = ConsistencyLayer(mode="label_first", k=3, voters=(a, b), fields=FIELDS).check(
+        RECORD, ctx(l5_verdict())
+    )
+    assert v.details["ballots"] == [
+        {"stage": "consistency_judge", "model": "voter-a", "temperature": 0.4, "vote": None},
+        {"stage": None, "model": None, "temperature": None, "vote": "yes"},
+        {"stage": "consistency_judge", "model": "voter-a", "temperature": 0.4, "vote": None},
+    ]
+
+
+def test_answer_emergent_ballots_cycle_the_answerers_temperatures():
+    backend = MockBackend(["Answer: B", "Answer: B", "no idea"], model="answerer")
+    answerer = BackendAnswerer(backend, temperatures=(0.3, 0.6), stage="consistency_judge")
+    lay = ConsistencyLayer(
+        mode="answer_emergent", k=3, fields=("question",), answerer=answerer, extractor=letter
+    )
+    v = lay.check(RECORD, ctx(l5_verdict()))
+    assert v.details["ballots"] == [
+        {"stage": "consistency_judge", "model": "answerer", "temperature": 0.3, "vote": "B"},
+        {"stage": "consistency_judge", "model": "answerer", "temperature": 0.6, "vote": "B"},
+        {"stage": "consistency_judge", "model": "answerer", "temperature": 0.3, "vote": None},
+    ]
+    # A bare answerer callable records only the votes.
+    plain = answer_layer(["Answer: B"] * 5).check(RECORD, ctx(l5_verdict()))
+    assert plain.details["ballots"][0] == {
+        "stage": None,
+        "model": None,
+        "temperature": None,
+        "vote": "B",
+    }
+
+
+def test_from_spec_answerer_reports_the_voting_stage():
+    cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
+    lay = ConsistencyLayer.from_spec(cfa, backend=MockBackend(["Answer: A"], cycle=True))
+    assert lay.answerer.stage == "judge"
+
+
+def test_cascade_writes_ballots_into_provenance(fag, seeds):
+    from sdgf.store.provenance import Ballot, Provenance, ProvenanceBuilder
+
+    seed = next(s for s in seeds if s["label"] is True)
+    spec = with_validation(fag, consistency_k=3)
+    backend = by_temperature({0.7: "breach", 0.8: "no_breach", 0.9: "breach"})
+    lay = ConsistencyLayer.from_spec(spec, backend=backend)
+    prov = ProvenanceBuilder(
+        "v1", "c1", 0, [{"stage": "generator", "backend": "mock", "model": "g", "hosting": "local"}]
+    )
+    prov.set_prompt("p")
+    assert Cascade([lay]).run(seed, escalated(seed), prov).passed
+    (l6,) = prov.build().layer_results
+    assert l6.ballots == (
+        Ballot("breach", "judge", "mock", 0.7),
+        Ballot("no_breach", "judge", "mock", 0.8),
+        Ballot("breach", "judge", "mock", 0.9),
+    )
+    # The ballots survive the JSON round trip of the accepted stream.
+    stored = json.loads(json.dumps(prov.build().to_dict()))
+    assert stored["layer_results"][0]["ballots"][1] == {
+        "vote": "no_breach",
+        "stage": "judge",
+        "model": "mock",
+        "temperature": 0.8,
+    }
+    assert Provenance.from_dict(stored).layer_results[0].ballots == l6.ballots
+
+
+def test_pipeline_ballots_name_the_consistency_judge_model(fag, seeds, tmp_path):
+    models = fag.spec.models
+    voter = models.judge.model_copy(update={"model": "voter"})
+    spec = dataclasses.replace(
+        fag,
+        spec=fag.spec.model_copy(
+            update={"models": models.model_copy(update={"consistency_judge": voter})}
+        ),
+    )
+    votes = by_temperature({0.7: "breach", 0.8: "no_breach", 0.9: "breach"})
+    pipe = Pipeline(
+        spec,
+        tmp_path / "store",
+        model_overrides={"generator": MockBackend(["{}"]), "consistency_judge": votes},
+        layers=["L6"],
+    )
+    seed = next(s for s in seeds if s.get("contestable") is True)
+    result = pipe.cascade.run(seed, ValidationContext(recipe=seed))
+    ballots = result.verdicts[-1].details["ballots"]
+    assert {b["stage"] for b in ballots} == {"consistency_judge"}
+    assert [b["temperature"] for b in ballots[:3]] == [0.7, 0.8, 0.9]

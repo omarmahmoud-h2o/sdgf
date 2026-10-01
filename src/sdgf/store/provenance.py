@@ -3,6 +3,8 @@
 Every accepted record carries: spec_version, the generator and judge model ids with
 their hosting (D12), the prompt hash, the random seed, the coverage cell, the tool
 trace, the result of each validation layer, the repair count, and any human decisions.
+A layer that votes (L6) also records each vote with its stage, model and temperature
+(LayerResult.ballots), so vote agreement can be analysed after a run.
 
 A ProvenanceBuilder collects these while a record moves through generation, the
 cascade and repair; build() freezes them into a Provenance. Provenance round-trips
@@ -15,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from sdgf.spec.schema import Hosting, LayerName
 
@@ -73,11 +75,22 @@ class ToolTraceEntry:
 
 
 @dataclass(frozen=True)
+class Ballot:
+    """One vote a layer took, and where it came from; None where the voter didn't say."""
+
+    vote: Any = None  # None is an abstention (an unparseable vote)
+    stage: str | None = None
+    model: str | None = None
+    temperature: float | None = None
+
+
+@dataclass(frozen=True)
 class LayerResult:
     layer: LayerName
     outcome: LayerOutcome
     attempt: int = 0  # 0 is the first generation, n is the n-th repair
     errors: tuple[str, ...] = ()
+    ballots: tuple[Ballot, ...] = ()  # in vote order; empty when the layer took no votes
 
     def __post_init__(self) -> None:
         if self.outcome not in _LAYER_OUTCOMES:
@@ -162,7 +175,13 @@ class Provenance:
                 prompt_hash=d["prompt_hash"],
                 models=tuple(ModelRef(**m) for m in d["models"]),
                 layer_results=tuple(
-                    LayerResult(**{**r, "errors": tuple(r.get("errors", ()))})
+                    LayerResult(
+                        **{
+                            **r,
+                            "errors": tuple(r.get("errors", ())),
+                            "ballots": tuple(Ballot(**b) for b in r.get("ballots", ())),
+                        }
+                    )
                     for r in d.get("layer_results", ())
                 ),
                 tool_trace=tuple(ToolTraceEntry(**t) for t in d.get("tool_trace", ())),
@@ -205,11 +224,19 @@ class ProvenanceBuilder:
         self.tool_trace.append(entry)
 
     def add_layer_result(
-        self, layer: LayerName, outcome: LayerOutcome, errors: list[str] | tuple[str, ...] = ()
+        self,
+        layer: LayerName,
+        outcome: LayerOutcome,
+        errors: list[str] | tuple[str, ...] = (),
+        ballots: Iterable[Ballot | Mapping[str, Any]] = (),
     ) -> None:
         self.layer_results.append(
             LayerResult(
-                layer=layer, outcome=outcome, attempt=self.repair_count, errors=tuple(errors)
+                layer=layer,
+                outcome=outcome,
+                attempt=self.repair_count,
+                errors=tuple(errors),
+                ballots=tuple(b if isinstance(b, Ballot) else Ballot(**b) for b in ballots),
             )
         )
 

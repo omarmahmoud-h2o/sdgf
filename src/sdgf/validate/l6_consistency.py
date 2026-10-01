@@ -28,6 +28,12 @@ A judge is trusted only once its calibration passed (judge/calibration.py); unti
 its confidence isn't evidence and K votes are taken. answer_emergent always votes, since
 there the votes produce the answer rather than check it.
 
+Each vote's source is kept with it: details["ballots"] lists, per vote, the models stage,
+the model, the temperature and the vote, and the cascade copies these into the record's
+provenance (layer_results[].ballots), so vote agreement can be analysed per model and
+temperature after a run. A voter that doesn't report one of these (a hand-built judge or
+answerer) records it as None.
+
 An unparseable vote (a JudgeParseError, or an answer the extractor can't read) is an
 abstention: it counts in neither the numerator nor the denominator. DS²-Instruct divided
 by K including None answers (§12.1), so abstentions silently pulled good records below
@@ -72,6 +78,7 @@ class BackendAnswerer:
         suffix: str = "",
         max_tokens: int = 1024,
         temperatures: Sequence[float] = (0.7, 0.8, 0.9),
+        stage: str | None = None,
     ):
         if not temperatures:
             raise ConsistencyError("BackendAnswerer needs at least one temperature")
@@ -80,13 +87,29 @@ class BackendAnswerer:
         self.suffix = suffix
         self.max_tokens = max_tokens
         self.temperatures = tuple(temperatures)
+        self.stage = stage
+
+    def temperature(self, index: int) -> float:
+        return self.temperatures[index % len(self.temperatures)]
 
     def __call__(self, view: Record, index: int) -> str | None:
         prompt = str(view[self.question_field])
         if self.suffix:
             prompt += "\n\n" + self.suffix
-        temperature = self.temperatures[index % len(self.temperatures)]
-        return self.backend.call(prompt, self.max_tokens, temperature).text
+        return self.backend.call(prompt, self.max_tokens, self.temperature(index)).text
+
+
+def ballot(voter: Any, index: int, vote: Any) -> dict[str, Any]:
+    """One vote with where it came from: {stage, model, temperature, vote}."""
+    temperature = getattr(voter, "temperature", None)
+    if callable(temperature):
+        temperature = temperature(index)
+    return {
+        "stage": getattr(voter, "stage", None),
+        "model": getattr(getattr(voter, "backend", None), "model", None),
+        "temperature": temperature,
+        "vote": vote,
+    }
 
 
 def vote_stage(compiled: CompiledSpec) -> str:
@@ -121,6 +144,7 @@ def vote_answerer(compiled: CompiledSpec, backend: ModelBackend) -> BackendAnswe
         suffix=task_type.answer_suffix(),
         max_tokens=cfg.max_tokens if cfg is not None else 1024,
         temperatures=compiled.spec.validation.consistency.temperatures,
+        stage=vote_stage(compiled),
     )
 
 
@@ -280,11 +304,14 @@ class ConsistencyLayer(Layer):
 
     def _judge_votes(self, view: Record, label: Any) -> LayerVerdict:
         verdicts: list[str | None] = []
+        ballots: list[dict[str, Any]] = []
         for i in range(self.k):
+            voter = self.voters[i % len(self.voters)]
             try:
-                verdicts.append(self.voters[i % len(self.voters)].judge(view).verdict)
+                verdicts.append(voter.judge(view).verdict)
             except JudgeParseError:
                 verdicts.append(None)
+            ballots.append(ballot(voter, i, verdicts[-1]))
         cast = [v for v in verdicts if v is not None]
         agree = sum(verdict_means(self.labels, v, label) for v in cast)
         top, _, _ = majority(verdicts)
@@ -293,6 +320,7 @@ class ConsistencyLayer(Layer):
             "method": "votes",
             "k": self.k,
             "votes": verdicts,
+            "ballots": ballots,
             "cast": len(cast),
             "abstained": self.k - len(cast),
             "agree": agree,
@@ -321,6 +349,7 @@ class ConsistencyLayer(Layer):
             "method": "votes",
             "k": self.k,
             "votes": answers,
+            "ballots": [ballot(self.answerer, i, a) for i, a in enumerate(answers)],
             "cast": cast,
             "abstained": self.k - cast,
             "agree": count,

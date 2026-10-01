@@ -121,7 +121,12 @@ class Cascade:
                 raise CascadeError(f"layer {layer.name} returned a verdict for {verdict.layer}")
             verdicts.append(verdict)
             if provenance is not None:
-                provenance.add_layer_result(verdict.layer, verdict.outcome, verdict.messages())
+                provenance.add_layer_result(
+                    verdict.layer,
+                    verdict.outcome,
+                    verdict.messages(),
+                    ballots=verdict.details.get("ballots", ()),
+                )
             if not verdict.passed:
                 break
         return CascadeResult(tuple(verdicts))

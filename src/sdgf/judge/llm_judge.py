@@ -72,6 +72,7 @@ class LLMJudge(Judge):
         max_tokens: int = 1024,
         temperature: float = 0.0,
         parse_retries: int = 1,
+        stage: str | None = None,
     ):
         super().__init__(schema)
         if parse_retries < 0:
@@ -84,6 +85,7 @@ class LLMJudge(Judge):
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.parse_retries = parse_retries
+        self.stage = stage  # the models stage this judge calls, for provenance
         self.static_prefix = self._static_prefix()
 
     @classmethod
@@ -105,6 +107,7 @@ class LLMJudge(Judge):
             kwargs.setdefault("temperature", config.temperature)
         kwargs.setdefault("fields", task_type.judge_fields())
         kwargs.setdefault("context", spec.task.description)
+        kwargs.setdefault("stage", stage)
         return cls(compile_rubric(spec.rubric), backend, **kwargs)
 
     # ── prompts ──────────────────────────────────────────────────

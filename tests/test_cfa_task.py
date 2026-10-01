@@ -242,6 +242,13 @@ def test_cfa_every_record_is_voted_and_passes_l6(released):
         for x in r[PROVENANCE_KEY]["layer_results"]
         if x["layer"] == "L6"
     )
+    # each vote is in provenance with the stage and temperature it was sampled at
+    for r in accepted:
+        for x in r[PROVENANCE_KEY]["layer_results"]:
+            if x["layer"] == "L6":
+                assert [b["temperature"] for b in x["ballots"]] == [0.7, 0.8, 0.9, 0.7, 0.8]
+                assert {b["stage"] for b in x["ballots"]} == {"judge"}
+                assert [b["vote"] for b in x["ballots"]].count(None) >= 1
 
 
 def test_cfa_wrong_first_answers_are_repaired_at_l5(released):

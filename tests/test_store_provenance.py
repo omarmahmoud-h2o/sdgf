@@ -213,3 +213,28 @@ def test_accepted_stream_round_trip(tmp_path):
         w.write(attach(RECORD, p))
     [row] = run.read_jsonl("accepted")
     assert split(row) == (RECORD, p)
+
+
+def test_layer_results_carry_ballots_and_older_provenance_still_parses():
+    from sdgf.store.provenance import Ballot
+
+    b = builder()
+    b.set_prompt("p")
+    b.add_layer_result("L1", "pass")
+    b.add_layer_result(
+        "L6",
+        "pass",
+        ballots=[
+            {"stage": "judge", "model": "judge-mock", "temperature": 0.7, "vote": "breach"},
+            Ballot(vote=None, stage="judge", model="judge-mock", temperature=0.8),
+        ],
+    )
+    p = b.build()
+    assert p.layer_results[0].ballots == ()
+    assert p.layer_results[1].ballots[0] == Ballot("breach", "judge", "judge-mock", 0.7)
+    d = json.loads(json.dumps(p.to_dict()))
+    assert Provenance.from_dict(d) == p
+    # Provenance written before ballots existed has none and still reads back.
+    for r in d["layer_results"]:
+        del r["ballots"]
+    assert all(r.ballots == () for r in Provenance.from_dict(d).layer_results)
