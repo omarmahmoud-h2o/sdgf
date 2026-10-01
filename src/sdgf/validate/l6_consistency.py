@@ -18,6 +18,12 @@ record whose answer differs from the majority is sent back for repair
 The winning voter's response is kept only in the details, not written into the record,
 since the cheaper layers (governance, overlap) never checked that text.
 
+Under label_first the votes come from `voters`, one judge per vote temperature, cycled
+per vote (vote i asks voters[i % len(voters)]). from_spec builds them from
+validation.consistency.temperatures on the voting stage's backend: models.consistency_judge
+when set, else models.judge. Reusing L5's own temperature-0 judge K times would return the
+same verdict K times, confirming a wrong L5 verdict instead of challenging it.
+
 A judge is trusted only once its calibration passed (judge/calibration.py); until then
 its confidence isn't evidence and K votes are taken. answer_emergent always votes, since
 there the votes produce the answer rather than check it.
@@ -37,7 +43,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from sdgf.judge.calibration import CalibrationResult, trust_for
 from sdgf.judge.interface import Judge, JudgeError, JudgeParseError
-from sdgf.judge.llm_judge import judge_view
+from sdgf.judge.llm_judge import LLMJudge, judge_view
 from sdgf.models.base import ModelBackend
 from sdgf.spec.schema import EscalationRules, GenerationMode
 from sdgf.tasktypes.base import AnswerExtractor
@@ -83,6 +89,41 @@ class BackendAnswerer:
         return self.backend.call(prompt, self.max_tokens, temperature).text
 
 
+def vote_stage(compiled: CompiledSpec) -> str:
+    """The models stage L6 votes with: consistency_judge when configured, else judge."""
+    return "consistency_judge" if compiled.spec.models.consistency_judge is not None else "judge"
+
+
+def vote_judges(compiled: CompiledSpec, backend: ModelBackend) -> tuple[Judge, ...]:
+    """One blind LLMJudge per validation.consistency temperature, on the voting stage."""
+    stage = vote_stage(compiled)
+    return tuple(
+        LLMJudge.from_spec(compiled, backend, stage=stage, temperature=t)
+        for t in compiled.spec.validation.consistency.temperatures
+    )
+
+
+def vote_answerer(compiled: CompiledSpec, backend: ModelBackend) -> BackendAnswerer:
+    """The answer_emergent voter: the task type's one question field, cycling temperatures."""
+    from sdgf.tasktypes.registry import REGISTRY
+
+    task_type = REGISTRY.resolve(compiled.spec.task)
+    fields = task_type.judge_fields()
+    if len(fields) != 1:
+        raise ConsistencyError(
+            f"the default L6 answerer answers one question field, but task type "
+            f"{task_type.name!r} shows the judge {list(fields)}; pass an answerer"
+        )
+    cfg = getattr(compiled.spec.models, vote_stage(compiled))
+    return BackendAnswerer(
+        backend,
+        question_field=fields[0],
+        suffix=task_type.answer_suffix(),
+        max_tokens=cfg.max_tokens if cfg is not None else 1024,
+        temperatures=compiled.spec.validation.consistency.temperatures,
+    )
+
+
 def majority(votes: Iterable[Any]) -> tuple[Any, int, int]:
     """(most common vote, its count, votes cast), with None votes as abstentions.
 
@@ -104,6 +145,7 @@ class ConsistencyLayer(Layer):
         mode: GenerationMode,
         k: int,
         judge: Judge | None = None,
+        voters: Sequence[Judge] | None = None,
         fields: Iterable[str] = (),
         labels: Mapping[str, Any] | None = None,
         escalation: EscalationRules | None = None,
@@ -124,13 +166,22 @@ class ConsistencyLayer(Layer):
         self.trusted = trusted
         self.escalated_only = escalated_only
         self.answer_field = answer_field
-        self.judge = judge
+        if judge is not None and voters is not None:
+            raise ConsistencyError("give L6 either one judge or its voters, not both")
+        self.voters: tuple[Judge, ...] = (
+            tuple(voters) if voters is not None else (judge,) if judge is not None else ()
+        )
+        self.judge = self.voters[0] if self.voters else None
         self.answerer = answerer
         self.extractor = extractor
         if mode == "label_first":
-            if judge is None:
+            if self.judge is None:
                 raise ConsistencyError("label_first consistency votes with a judge; give one")
-            values = judge.schema.verdict_values
+            if any(
+                v.schema.verdict_values != self.judge.schema.verdict_values for v in self.voters
+            ):
+                raise ConsistencyError("every L6 voter must share one verdict schema")
+            values = self.judge.schema.verdict_values
             self.labels = dict(labels) if labels is not None else {v: v for v in values}
             unknown = sorted(set(self.labels) - set(values))
             if unknown:
@@ -154,6 +205,8 @@ class ConsistencyLayer(Layer):
         compiled: CompiledSpec,
         *,
         judge: Judge | None = None,
+        voters: Sequence[Judge] | None = None,
+        backend: ModelBackend | None = None,
         trusted: bool = False,
         answerer: Answerer | None = None,
         fields: Iterable[str] | None = None,
@@ -161,6 +214,10 @@ class ConsistencyLayer(Layer):
         judge_name: str | None = None,
     ) -> ConsistencyLayer:
         """L6 for a compiled spec, with K from validation.consistency_k.
+
+        With a voting `backend` and no judge, voters or answerer given, L6 builds its own:
+        under label_first one LLMJudge per validation.consistency temperature (vote_judges),
+        under answer_emergent a BackendAnswerer cycling the same temperatures.
 
         The judge is trusted when `calibration` (judge/calibration.py) passed for this
         spec_version and judge model (judge_name, default the spec's models.judge), or
@@ -171,10 +228,15 @@ class ConsistencyLayer(Layer):
         spec = compiled.spec
         task_type = REGISTRY.resolve(spec.task)
         emergent = spec.task.generation_mode == "answer_emergent"
+        if backend is not None and judge is None and voters is None and not emergent:
+            voters = vote_judges(compiled, backend)
+        if backend is not None and answerer is None and emergent:
+            answerer = vote_answerer(compiled, backend)
         return cls(
             mode=spec.task.generation_mode,
             k=spec.validation.consistency_k,
             judge=judge,
+            voters=voters,
             fields=task_type.judge_fields() if fields is None else fields,
             labels=spec.rubric.verdict.labels,
             escalation=spec.validation.escalation,
@@ -218,9 +280,9 @@ class ConsistencyLayer(Layer):
 
     def _judge_votes(self, view: Record, label: Any) -> LayerVerdict:
         verdicts: list[str | None] = []
-        for _ in range(self.k):
+        for i in range(self.k):
             try:
-                verdicts.append(self.judge.judge(view).verdict)
+                verdicts.append(self.voters[i % len(self.voters)].judge(view).verdict)
             except JudgeParseError:
                 verdicts.append(None)
         cast = [v for v in verdicts if v is not None]

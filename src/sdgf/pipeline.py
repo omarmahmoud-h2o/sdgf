@@ -68,11 +68,13 @@ the run cleanly between waves, overshooting by at most what that estimate missed
 from what was accepted, with the budget applying afresh to that invocation, while
 usage.json keeps the run's total. Release rounds within one invocation share a budget.
 
-Under answer_emergent, L6's K answers come from the judge stage's backend unless an
-answerer is passed: a BackendAnswerer shown only the question plus the task type's answer
-suffix, so the votes are independent of the generator and no new endpoint gets data.
+L6 votes on models.consistency_judge when it is set, else on the judge stage's backend,
+cycling validation.consistency.temperatures per vote: under label_first one blind judge
+per temperature (not L5's judge reused K times), under answer_emergent, unless an
+answerer is passed, a BackendAnswerer shown only the question plus the task type's answer
+suffix, so the votes are independent of the generator.
 
-L5 (judge) and L6 (consistency) build the judge stage, and the fallback judge only when
+L5 (judge) and L6 (consistency) build the judge stage (L6 only without a consistency_judge), and the fallback judge only when
 the rubric may ask for reasons, so the D12 endpoint record names only models that get
 data. The judge counts as trusted when a calibration result for this spec_version and
 judge model is in the store (judge/calibration.py), or one is passed in. Layers the run
@@ -126,15 +128,19 @@ from sdgf.validate.l2_rules import RulesLayer
 from sdgf.validate.l3_governance import GovernanceLayer
 from sdgf.validate.l4_overlap import OverlapLayer
 from sdgf.validate.l5_judge import JudgeLayer, ReviewItem, ReviewSink
-from sdgf.validate.l6_consistency import Answerer, BackendAnswerer, ConsistencyLayer
+from sdgf.validate.l6_consistency import (
+    Answerer,
+    ConsistencyError,
+    ConsistencyLayer,
+    vote_stage,
+)
 from sdgf.validate.repair import GENERATE_STAGE, Drop, DropLog, RepairLoop
 
 log = logging.getLogger(__name__)
 
 IMPLEMENTED_LAYERS: tuple[str, ...] = ("L1", "L2", "L3", "L4", "L5", "L6")
-JUDGE_LAYERS: tuple[str, ...] = ("L5", "L6")
 # Stages whose calls run inside a slot, so on the thread pool; expansion runs before it.
-POOL_STAGES: tuple[str, ...] = ("generator", "judge", "fallback_judge")
+POOL_STAGES: tuple[str, ...] = ("generator", "judge", "fallback_judge", "consistency_judge")
 
 ACCEPTED_STREAM = "accepted"
 DROPS_STREAM = "drops"
@@ -328,7 +334,7 @@ class Pipeline:
         spec_models = spec_models.model_copy(
             update={
                 st: None
-                for st in ("judge", "fallback_judge", "expansion")
+                for st in ("judge", "fallback_judge", "consistency_judge", "expansion")
                 if st not in self.used_stages
             }
         )
@@ -396,10 +402,14 @@ class Pipeline:
         # Stage 1 calls the expansion model only for keyword axes, and only to build a plan.
         if keyword_sources(self.compiled.spec.coverage) and not self._plan_cached():
             stages.append("expansion")
-        if any(n in JUDGE_LAYERS for n in self.layers):
-            stages.append("judge")
-        # The fallback judge only writes reasons, so it gets data only if the rubric asks.
         spec = self.compiled.spec
+        # L6 votes on models.consistency_judge when set, so then only L5 needs the judge.
+        own_voters = "L6" in self.layers and spec.models.consistency_judge is not None
+        if "L5" in self.layers or ("L6" in self.layers and not own_voters):
+            stages.append("judge")
+        if own_voters:
+            stages.append("consistency_judge")
+        # The fallback judge only writes reasons, so it gets data only if the rubric asks.
         if (
             "L5" in self.layers
             and spec.models.fallback_judge is not None
@@ -460,31 +470,16 @@ class Pipeline:
             ),
             "L6": lambda: ConsistencyLayer.from_spec(
                 self.compiled,
-                judge=self.judge,
-                answerer=answerer if answerer is not None else self._answerer(),
+                backend=self._bounded[vote_stage(self.compiled)],
+                answerer=answerer,
                 calibration=calibration,
                 judge_name=judge_name,
             ),
         }
-        return {name: build[name]() for name in self.layers}
-
-    def _answerer(self) -> Answerer | None:
-        """The default L6 answerer for answer_emergent: K fresh answers from the judge stage."""
-        if self.compiled.spec.task.generation_mode != "answer_emergent":
-            return None
-        fields = self.task_type.judge_fields()
-        if len(fields) != 1:
-            raise PipelineError(
-                f"the default L6 answerer answers one question field, but task type "
-                f"{self.task_type.name!r} shows the judge {list(fields)}; pass an answerer"
-            )
-        cfg = self.compiled.spec.models.judge
-        return BackendAnswerer(
-            self._bounded["judge"],
-            question_field=fields[0],
-            suffix=self.task_type.answer_suffix(),
-            max_tokens=cfg.max_tokens if cfg is not None else 1024,
-        )
+        try:
+            return {name: build[name]() for name in self.layers}
+        except ConsistencyError as e:
+            raise PipelineError(str(e)) from e
 
     def _intake_summary(self) -> dict[str, Any]:
         spec = self.compiled.spec

@@ -191,7 +191,9 @@ Stage 0 re-scans every seed and refuses to compile if any seed fails.
 ### `models`
 
 The stages are `generator` (required), `judge` (required when L5 is on),
-`fallback_judge` and `expansion`. Each stage takes these keys:
+`fallback_judge`, `consistency_judge` (L6's voters, when they should come from a
+different model than L5's judge; unset means L6 votes with `judge`) and `expansion`.
+Each stage takes these keys:
 
 | Key | Meaning |
 |---|---|
@@ -212,10 +214,13 @@ go in the spec.
 - `repair_tries` (default 2): the number of re-prompts with the validator's errors
   before the record is dropped.
 - `consistency_k` (default 5): the number of L6 votes.
+- `consistency`: `temperatures` (default `[0.7, 0.8, 0.9]`). Vote i is sampled at
+  `temperatures[i % len]`, overriding the voting stage's own temperature, so K votes
+  from a temperature-0 judge don't just repeat L5's verdict.
 - `escalation`: `low_confidence` (default 0.7), `on_hard_cells`, `on_contestable`, and
   `always` (default false; escalate every record, as CFA does for DS²-Instruct
   self-consistency). Escalated records go to L6. Under `answer_emergent`, L6's K answers
-  come from the judge stage's model, shown only the question and the answer format.
+  come from the voting stage's model, shown only the question and the answer format.
 - `calibration`: `ece_max`, `bins` and `min_gold`. These, together with
   `thresholds.kappa_min`, decide when the judge's confidence can stand in for K votes.
 - `rules`: L2 keyword rules. Each rule has these keys:
@@ -318,6 +323,7 @@ test suite never need them.
 | `pii` | `presidio-analyzer`, `presidio-anonymizer` | `governance.pii.PresidioPIIScanner` (the default is a regex scanner for email, phone, ABN, TFN, BSB and account numbers, plus per-task patterns) |
 | `toxicity` | `detoxify` | `governance.toxicity.DetoxifyToxicityScanner` (the default is a keyword list) |
 | `embeddings` | `sentence-transformers` | `validate.l4_overlap.sentence_transformers_embedder`, for L4 embedding overlap and the `semantic_diversity_min` cluster entropy (the default is character-shingle Jaccard) |
+| `docs` | `markdown` | not an adapter: `docs/build_guide.py` uses it to build `docs/sdgf-guide.html` |
 | `retrieval` | `rank-bm25` | not required: `coverage/retrieval.py` is a pure-Python BM25 that scores the same as `rank_bm25.BM25Okapi` |
 
 Install an extra with `pip install -e '.[pii]'`. Model SDKs work the same way:

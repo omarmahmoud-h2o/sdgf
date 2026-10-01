@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 
@@ -7,7 +8,14 @@ from sdgf.judge.interface import Judge, JudgeParseError, JudgeResult, compile_ru
 from sdgf.judge.llm_judge import LLMJudge
 from sdgf.models.mock import MockBackend
 from sdgf.spec.compile import compile_spec
-from sdgf.spec.schema import EscalationRules, RubricSection
+from sdgf.pipeline import Pipeline
+from sdgf.spec.schema import (
+    ConsistencyRules,
+    EscalationRules,
+    RubricSection,
+    SpecValidationError,
+    parse_spec,
+)
 from sdgf.validate.base import LayerVerdict, ValidationContext
 from sdgf.validate.cascade import Cascade
 from sdgf.validate.l5_judge import JudgeLayer
@@ -412,3 +420,140 @@ def test_label_first_from_spec_checks_no_answer_field():
     fag = compile_spec(FAG_DIR)
     judge = LLMJudge.from_spec(fag, MockBackend(["{}"], cycle=True))
     assert ConsistencyLayer.from_spec(fag, judge=judge).answer_field is None
+
+
+# ── per-vote diversity (validation.consistency, models.consistency_judge) ──
+
+
+def by_temperature(table):
+    """A judge backend whose verdict depends only on the sampling temperature."""
+    return MockBackend(lambda call: judge_reply(table[call.temperature], 0.6))
+
+
+def with_validation(compiled, **update):
+    validation = compiled.spec.validation.model_copy(update=update)
+    return dataclasses.replace(
+        compiled, spec=compiled.spec.model_copy(update={"validation": validation})
+    )
+
+
+def escalated(seed):
+    return ValidationContext(recipe={**seed, "contestable": True})
+
+
+def test_label_first_votes_cycle_temperatures_and_differ(fag, seeds):
+    seed = next(s for s in seeds if s["label"] is True)
+    k = fag.spec.validation.consistency_k
+    backend = by_temperature({0.7: "breach", 0.8: "no_breach", 0.9: "breach"})
+    lay = ConsistencyLayer.from_spec(fag, backend=backend)
+    assert [j.temperature for j in lay.voters] == [0.7, 0.8, 0.9]
+    v = lay.check(seed, escalated(seed))
+    temps = [0.7, 0.8, 0.9, 0.7, 0.8, 0.9, 0.7][:k]
+    assert [c.temperature for c in backend.calls] == temps
+    expected = ["no_breach" if t == 0.8 else "breach" for t in temps]
+    assert v.details["votes"] == expected and len(set(v.details["votes"])) == 2
+    # The majority is computed over the differing votes, not one repeated verdict.
+    assert v.details["agree"] == expected.count("breach") and v.details["majority"] == "breach"
+    assert v.passed
+    # Every vote is still blind: same view, no label.
+    assert '"label"' not in backend.calls[0].prompt
+
+
+def test_votes_differing_against_the_label_fail(fag, seeds):
+    seed = next(s for s in seeds if s["label"] is True)
+    backend = by_temperature({0.7: "no_breach", 0.8: "breach", 0.9: "no_breach"})
+    v = ConsistencyLayer.from_spec(fag, backend=backend).check(seed, escalated(seed))
+    assert set(v.details["votes"]) == {"breach", "no_breach"}
+    assert v.details["majority"] == "no_breach"
+    assert v.codes == ("consistency_disagrees",)
+
+
+def test_configured_temperatures_are_cycled(fag, seeds):
+    seed = next(s for s in seeds if s["label"] is True)
+    spec = with_validation(
+        fag, consistency_k=4, consistency=ConsistencyRules(temperatures=[0.2, 1.1])
+    )
+    backend = by_temperature({0.2: "breach", 1.1: "no_breach"})
+    v = ConsistencyLayer.from_spec(spec, backend=backend).check(seed, escalated(seed))
+    assert [c.temperature for c in backend.calls] == [0.2, 1.1, 0.2, 1.1]
+    assert v.details["votes"] == ["breach", "no_breach", "breach", "no_breach"]
+    assert v.codes == ("consistency_disagrees",)  # 2 of 4 is not a majority
+
+
+def test_l6_does_not_reuse_the_l5_judge(fag, seeds):
+    seed = next(s for s in seeds if s.get("contestable") is True)
+    l5_backend = MockBackend([judge_reply("breach", 0.95)])
+    votes = by_temperature({0.7: "breach", 0.8: "breach", 0.9: "breach"})
+    l5 = JudgeLayer.from_spec(fag, LLMJudge.from_spec(fag, l5_backend))
+    l6 = ConsistencyLayer.from_spec(fag, backend=votes)
+    result = Cascade([l5, l6]).run(seed, ValidationContext(recipe=seed))
+    assert result.passed and result.verdicts[-1].details["method"] == "votes"
+    assert [c.temperature for c in l5_backend.calls] == [fag.spec.models.judge.temperature]
+    assert len(votes.calls) == fag.spec.validation.consistency_k
+
+
+def test_explicit_voters_are_cycled_and_exclusive_with_judge():
+    a, b = VoteJudge(["yes"] * 3), VoteJudge(["no"] * 2)
+    lay = ConsistencyLayer(mode="label_first", k=5, voters=(a, b), fields=FIELDS)
+    v = lay.check(RECORD, ctx(l5_verdict()))
+    assert v.details["votes"] == ["yes", "no", "yes", "no", "yes"] and v.passed
+    with pytest.raises(ConsistencyError, match="not both"):
+        ConsistencyLayer(mode="label_first", k=3, judge=a, voters=(b,), fields=FIELDS)
+
+
+def test_consistency_temperatures_are_validated(fag):
+    data = fag.spec.model_dump(mode="json")
+    for bad in ([], [2.5], [-0.1]):
+        data["validation"]["consistency"] = {"temperatures": bad}
+        with pytest.raises(SpecValidationError, match="temperatures"):
+            parse_spec(data)
+    assert fag.spec.validation.consistency.temperatures == [0.7, 0.8, 0.9]
+
+
+def test_answer_emergent_answerer_cycles_the_configured_temperatures():
+    cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
+    spec = with_validation(cfa, consistency=ConsistencyRules(temperatures=[0.3, 0.6]))
+    lay = ConsistencyLayer.from_spec(spec, backend=MockBackend(["Answer: A"], cycle=True))
+    assert isinstance(lay.answerer, BackendAnswerer)
+    assert lay.answerer.temperatures == (0.3, 0.6)
+
+
+def test_pipeline_votes_on_the_consistency_judge_stage(fag, seeds, tmp_path):
+    models = fag.spec.models
+    voter = models.judge.model_copy(update={"model": "voter"})
+    spec = dataclasses.replace(
+        fag,
+        spec=fag.spec.model_copy(
+            update={"models": models.model_copy(update={"consistency_judge": voter})}
+        ),
+    )
+    l5_backend = MockBackend([judge_reply("breach", 0.95)], cycle=True)
+    votes = by_temperature({0.7: "breach", 0.8: "no_breach", 0.9: "breach"})
+    pipe = Pipeline(
+        spec,
+        tmp_path / "store",
+        model_overrides={
+            "generator": MockBackend(["{}"]),
+            "judge": l5_backend,
+            "consistency_judge": votes,
+        },
+        layers=["L5", "L6"],
+    )
+    assert pipe.used_stages == ("generator", "judge", "consistency_judge")
+    seed = next(s for s in seeds if s.get("contestable") is True)
+    result = pipe.cascade.run(seed, ValidationContext(recipe=seed))
+    assert result.verdicts[-1].details["method"] == "votes"
+    assert len(l5_backend.calls) == 1
+    assert len(votes.calls) == spec.spec.validation.consistency_k
+    assert {"stage": "consistency_judge", "backend": "mock", "model": "mock"} == {
+        k: v for k, v in pipe.models.endpoints()[-1].items() if k != "hosting"
+    }
+
+    # With L5 off and a consistency_judge set, the L5 judge model gets no data.
+    alone = Pipeline(
+        spec,
+        tmp_path / "store2",
+        model_overrides={"generator": MockBackend(["{}"]), "consistency_judge": votes},
+        layers=["L6"],
+    )
+    assert alone.used_stages == ("generator", "consistency_judge")

@@ -55,7 +55,9 @@ print("accepted per cell:", result.counts)
 print("drops by layer:", result.drops.by_layer())
 print("drops by code:", result.drops.by_code())
 # Every failed try, repairs included, so a layer that rejects and then gets repaired shows up.
-print("failed tries by layer:", Counter(l for d in result.drops.drops for l, _ in d.history))
+print(
+    "failed tries by layer:", Counter(layer for d in result.drops.drops for layer, _ in d.history)
+)
 print("run dir:", result.run.path if hasattr(result.run, "path") else result.run)
 
 if result.accepted:

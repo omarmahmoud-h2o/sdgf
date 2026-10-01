@@ -286,6 +286,9 @@ class ModelsSection(_Section):
     generator: ModelConfig
     judge: ModelConfig | None = None
     fallback_judge: ModelConfig | None = None
+    # L6's voters, when they should be a different model from L5's judge; unset means
+    # L6 votes with models.judge.
+    consistency_judge: ModelConfig | None = None
     expansion: ModelConfig | None = None
 
 
@@ -311,6 +314,25 @@ class CalibrationRules(_Section):
     ece_max: float = Field(default=0.10, ge=0.0, le=1.0)
     bins: int = Field(default=10, ge=1, le=100)
     min_gold: int = Field(default=30, ge=1)
+
+
+class ConsistencyRules(_Section):
+    """How L6 varies its K votes (§6.4, §11), beside validation.consistency_k.
+
+    Vote i is sampled at temperatures[i % len(temperatures)], under both generation
+    modes, overriding the voting stage's own temperature: K votes from one model at one
+    temperature 0 would just repeat L5's verdict. The default matches DS²-Instruct.
+    """
+
+    temperatures: list[float] = Field(default_factory=lambda: [0.7, 0.8, 0.9], min_length=1)
+
+    @field_validator("temperatures")
+    @classmethod
+    def _in_range(cls, v: list[float]) -> list[float]:
+        bad = [t for t in v if not 0.0 <= t <= 2.0]
+        if bad:
+            raise ValueError(f"temperatures must be within 0..2, got {bad}")
+        return v
 
 
 class KeywordRule(_Section):
@@ -350,6 +372,7 @@ class ValidationSection(_Section):
     layers: list[LayerName] = Field(default_factory=lambda: list(ALL_LAYERS), min_length=1)
     repair_tries: int = Field(default=2, ge=0)
     consistency_k: int = Field(default=5, ge=1)
+    consistency: ConsistencyRules = Field(default_factory=ConsistencyRules)
     escalation: EscalationRules = Field(default_factory=EscalationRules)
     calibration: CalibrationRules = Field(default_factory=CalibrationRules)
     rules: list[KeywordRule] = Field(default_factory=list)

@@ -18,7 +18,13 @@ from sdgf.models.base import ModelBackend, ModelBackendError
 from sdgf.models.mock import MockBackend
 from sdgf.spec.schema import Hosting, ModelConfig, ModelsSection
 
-STAGES: tuple[str, ...] = ("generator", "judge", "fallback_judge", "expansion")
+STAGES: tuple[str, ...] = (
+    "generator",
+    "judge",
+    "fallback_judge",
+    "consistency_judge",
+    "expansion",
+)
 
 BackendFactory = Callable[[ModelConfig], ModelBackend]
 
