@@ -650,6 +650,13 @@ reach a prompt.</p></section><section class="layer-pane" id="pane-L5" data-layer
 task type's judge fields: the conversation for FAG, the question for CFA. It never sees
 the label, the spans that justify the label, or the response. It returns a verdict, a
 score for each criterion in <code>rubric</code>, and a confidence for each.</p>
+<p>The judge's <code>## Context</code> is <code>rubric.judge_context</code> if set, else <code>task.description</code>.
+<code>task.description</code> is written for the generator, so a task whose description carries
+writer's instructions (annotate every claim, the fixed parameters) should set
+<code>judge_context</code> to just the definitions the judge needs. <code>rubric.examples</code> adds
+judge-only worked examples (a record view, the expected verdict, optional scores and a
+note) under <code>## Worked examples</code>. Neither ever reaches the generation prompt, and stage 0
+scans the examples for PII and toxicity like the seeds.</p>
 <div class="table-wrap"><table>
 <thead>
 <tr>
@@ -705,12 +712,21 @@ score for each criterion in <code>rubric</code>, and a confidence for each.</p>
 </tr>
 <tr>
 <td>answer found by the model (CFA)</td>
-<td>K fresh answers to the question (temperatures cycling 0.7 / 0.8 / 0.9). The majority answer must equal the record's answer, else sent back (<code>consistency_answer_mismatch</code>). No majority: sent back (<code>consistency_no_majority</code>).</td>
+<td>K fresh answers to the question. The majority answer must equal the record's answer, else sent back (<code>consistency_answer_mismatch</code>). No majority: sent back (<code>consistency_no_majority</code>).</td>
 </tr>
 </tbody>
 </table></div>
+<p>In both modes vote i is sampled at <code>validation.consistency.temperatures[i % len]</code>
+(default 0.7 / 0.8 / 0.9), overriding the voting stage's own temperature. Without this,
+a temperature-0 judge would cast L5's verdict K times. The votes come from
+<code>models.consistency_judge</code> if set, so they can come from a different model than L5;
+otherwise from <code>models.judge</code>. With L6 on and <code>consistency_k</code> above 1, stage 0 rejects a
+temperature list that is all 0, since the K votes would be identical.</p>
 <p>A vote that can't be read doesn't count either way. If none can be read, the judge is
 broken, not the record: dropped (<code>consistency_no_votes</code>).</p>
+<p>Each vote is kept with its stage, model and temperature, in L6's <code>ballots</code> detail and in
+the record's provenance (<code>layer_results[].ballots</code>), so vote agreement can be analysed
+after a run.</p>
 <div class="compare" data-show="fag"><div class="seg" role="group" aria-label="Example"><button type="button" data-show="fag" aria-pressed="true">FAG</button><button type="button" data-show="cfa" aria-pressed="false">CFA</button><button type="button" data-show="both" aria-pressed="false">Side by side</button></div><div class="cmp-head"><div></div><div data-side="fag">FAG</div><div data-side="cfa">CFA</div></div><div class="cmp-row"><div class="cmp-label">Flagged because</div><div class="cmp-cell" data-side="fag">The judge agreed but with confidence 0.6, below 0.7.</div><div class="cmp-cell" data-side="cfa">Every CFA record is flagged (<code>escalation.always: true</code>).</div></div><div class="cmp-row"><div class="cmp-label">Fails when</div><div class="cmp-cell" data-side="fag">5 votes: 2 breach, 3 no breach.</div><div class="cmp-cell" data-side="cfa">5 answers: C, C, B, C, unreadable. The majority is C; the record says B.</div></div><div class="cmp-row"><div class="cmp-label">Issue code</div><div class="cmp-cell" data-side="fag"><code>consistency_disagrees</code></div><div class="cmp-cell" data-side="cfa"><code>consistency_answer_mismatch</code></div></div><div class="cmp-row"><div class="cmp-label">Result</div><div class="cmp-cell" data-side="fag">sent back</div><div class="cmp-cell" data-side="cfa">sent back</div></div></div>
 
 <p>Cost: up to K calls (<code>consistency_k</code>, 5 for both tasks), only for flagged candidates.
@@ -934,6 +950,9 @@ rubric:                              # what the blind judge returns; never conta
   criteria:
     - {name: realism, min: 1, max: 5}
   reason_required: never
+  # judge_context: &gt;-               # optional: the judge's context instead of task.description
+  #   Definitions the judge needs, without the writer's instructions.
+  # examples: []                    # optional judge-only worked examples (fictional only)
 
 seeds: {path: seeds.jsonl, format: annotated, uses: [few_shot], few_shot_count: 3}
 
@@ -956,6 +975,7 @@ validation:
   layers: [L1, L2, L3, L4, L5, L6]
   repair_tries: 2                    # re-prompts before a candidate is dropped
   consistency_k: 5                   # extra votes at L6
+  consistency: {temperatures: [0.7, 0.8, 0.9]}   # vote i at temperatures[i % len]
   escalation: {low_confidence: 0.7, on_hard_cells: true, on_contestable: true}
   calibration: {ece_max: 0.10, bins: 10, min_gold: 30}
 

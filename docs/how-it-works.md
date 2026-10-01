@@ -157,6 +157,14 @@ task type's judge fields: the conversation for FAG, the question for CFA. It nev
 the label, the spans that justify the label, or the response. It returns a verdict, a
 score for each criterion in `rubric`, and a confidence for each.
 
+The judge's `## Context` is `rubric.judge_context` if set, else `task.description`.
+`task.description` is written for the generator, so a task whose description carries
+writer's instructions (annotate every claim, the fixed parameters) should set
+`judge_context` to just the definitions the judge needs. `rubric.examples` adds
+judge-only worked examples (a record view, the expected verdict, optional scores and a
+note) under `## Worked examples`. Neither ever reaches the generation prompt, and stage 0
+scans the examples for PII and toxicity like the seeds.
+
 | Judge result | Outcome |
 |---|---|
 | agrees, confident | pass |
@@ -186,10 +194,21 @@ Runs only on flagged candidates. Every other candidate passes without a call
 |---|---|
 | label set by code (FAG), judge trusted, L5 confident and agreeing | pass, no votes |
 | label set by code (FAG), otherwise | K judge votes. More than half of the readable votes must agree with the label, else sent back (`consistency_disagrees`). |
-| answer found by the model (CFA) | K fresh answers to the question (temperatures cycling 0.7 / 0.8 / 0.9). The majority answer must equal the record's answer, else sent back (`consistency_answer_mismatch`). No majority: sent back (`consistency_no_majority`). |
+| answer found by the model (CFA) | K fresh answers to the question. The majority answer must equal the record's answer, else sent back (`consistency_answer_mismatch`). No majority: sent back (`consistency_no_majority`). |
+
+In both modes vote i is sampled at `validation.consistency.temperatures[i % len]`
+(default 0.7 / 0.8 / 0.9), overriding the voting stage's own temperature. Without this,
+a temperature-0 judge would cast L5's verdict K times. The votes come from
+`models.consistency_judge` if set, so they can come from a different model than L5;
+otherwise from `models.judge`. With L6 on and `consistency_k` above 1, stage 0 rejects a
+temperature list that is all 0, since the K votes would be identical.
 
 A vote that can't be read doesn't count either way. If none can be read, the judge is
 broken, not the record: dropped (`consistency_no_votes`).
+
+Each vote is kept with its stage, model and temperature, in L6's `ballots` detail and in
+the record's provenance (`layer_results[].ballots`), so vote agreement can be analysed
+after a run.
 
 | | FAG | CFA |
 |---|---|---|

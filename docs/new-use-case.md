@@ -47,6 +47,9 @@ rubric:                              # what the blind judge returns; never conta
   criteria:
     - {name: realism, min: 1, max: 5}
   reason_required: never
+  # judge_context: >-               # optional: the judge's context instead of task.description
+  #   Definitions the judge needs, without the writer's instructions.
+  # examples: []                    # optional judge-only worked examples (fictional only)
 
 seeds: {path: seeds.jsonl, format: annotated, uses: [few_shot], few_shot_count: 3}
 
@@ -69,6 +72,7 @@ validation:
   layers: [L1, L2, L3, L4, L5, L6]
   repair_tries: 2                    # re-prompts before a candidate is dropped
   consistency_k: 5                   # extra votes at L6
+  consistency: {temperatures: [0.7, 0.8, 0.9]}   # vote i at temperatures[i % len]
   escalation: {low_confidence: 0.7, on_hard_cells: true, on_contestable: true}
   calibration: {ece_max: 0.10, bins: 10, min_gold: 30}
 
