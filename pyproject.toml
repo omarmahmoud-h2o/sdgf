@@ -23,6 +23,7 @@ toxicity = ["detoxify"]
 embeddings = ["sentence-transformers"]
 retrieval = ["rank-bm25"]
 dev = ["pytest", "ruff"]
+docs = ["markdown>=3.5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

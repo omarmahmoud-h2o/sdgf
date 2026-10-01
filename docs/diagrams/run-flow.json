@@ -1,0 +1,338 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "One sdgf Run",
+    "subtitle": "Stages 0 to 5: from a task spec to a release, or to a refill of the short cells",
+    "output": "docs/diagrams/run-flow.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/omarmahmoud-h2o/DS2_BB",
+      "provider": "github",
+      "revision": "ad5a253998bbe66cd92dc5632ed9c601f9d81025"
+    },
+    "legend": {
+      "entries": {
+        "external": {
+          "label": "Done by a person"
+        },
+        "backend": {
+          "label": "sdgf stage"
+        },
+        "security": {
+          "label": "Check"
+        },
+        "database": {
+          "label": "Files on disk"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "you",
+      "label": "You"
+    },
+    {
+      "id": "sdgf",
+      "label": "sdgf"
+    },
+    {
+      "id": "disk",
+      "label": "Files on disk"
+    }
+  ],
+  "mainPath": [
+    "spec",
+    "intake",
+    "plan",
+    "generate",
+    "checks",
+    "measure",
+    "gate",
+    "release"
+  ],
+  "nodes": [
+    {
+      "id": "spec",
+      "lane": "you",
+      "col": 0,
+      "type": "external",
+      "label": "Write task spec",
+      "sublabel": "task.yaml, hooks, seeds",
+      "width": 150
+    },
+    {
+      "id": "approve",
+      "lane": "you",
+      "col": 1,
+      "type": "external",
+      "label": "Approve plan",
+      "sublabel": "sdgf plan --approve",
+      "tag": "optional",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/hitl/queue.py",
+          "line": 284,
+          "end_line": 296
+        }
+      ]
+    },
+    {
+      "id": "intake",
+      "lane": "sdgf",
+      "col": 0,
+      "type": "backend",
+      "label": "0 Intake",
+      "sublabel": "check spec, scan seeds",
+      "tag": "spec version",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/spec/compile.py",
+          "line": 114,
+          "end_line": 160
+        }
+      ]
+    },
+    {
+      "id": "plan",
+      "lane": "sdgf",
+      "col": 1,
+      "type": "backend",
+      "label": "1 Plan",
+      "sublabel": "cells with quotas",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/coverage/plan.py",
+          "line": 267,
+          "end_line": 329
+        }
+      ]
+    },
+    {
+      "id": "generate",
+      "lane": "sdgf",
+      "col": 2,
+      "type": "backend",
+      "label": "2 Generate",
+      "sublabel": "cell furthest below quota",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/generate/scheduler.py",
+          "line": 118,
+          "end_line": 130
+        },
+        {
+          "path": "sdgf/src/sdgf/pipeline.py",
+          "line": 531,
+          "end_line": 637
+        }
+      ]
+    },
+    {
+      "id": "checks",
+      "lane": "sdgf",
+      "col": 3,
+      "type": "security",
+      "label": "3 Six checks",
+      "sublabel": "L1 to L6",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/pipeline.py",
+          "line": 764,
+          "end_line": 803
+        }
+      ]
+    },
+    {
+      "id": "measure",
+      "lane": "sdgf",
+      "col": 4,
+      "type": "backend",
+      "label": "4 Measure",
+      "sublabel": "whole run, all rounds",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/evaluation/metrics.py",
+          "line": 417,
+          "end_line": 440
+        }
+      ]
+    },
+    {
+      "id": "gate",
+      "lane": "sdgf",
+      "col": 5,
+      "type": "security",
+      "label": "5 Release check",
+      "sublabel": "every threshold met?",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/pipeline.py",
+          "line": 639,
+          "end_line": 722,
+          "label": "release + _round_stop"
+        }
+      ]
+    },
+    {
+      "id": "rundir",
+      "lane": "disk",
+      "col": 3,
+      "type": "database",
+      "label": "Run directory",
+      "sublabel": "accepted + drops jsonl",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/store/artefacts.py",
+          "line": 139,
+          "end_line": 230
+        }
+      ]
+    },
+    {
+      "id": "shortfall",
+      "lane": "disk",
+      "col": 4,
+      "type": "database",
+      "label": "Shortfall report",
+      "sublabel": "what failed, which cells",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/evaluation/reports.py",
+          "line": 404,
+          "end_line": 416
+        }
+      ]
+    },
+    {
+      "id": "release",
+      "lane": "disk",
+      "col": 5,
+      "type": "database",
+      "label": "Release",
+      "sublabel": "dataset, card, manifest",
+      "tag": "write-once",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/evaluation/reports.py",
+          "line": 267,
+          "end_line": 300
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "spec-intake",
+      "from": "spec",
+      "to": "intake",
+      "variant": "emphasis"
+    },
+    {
+      "id": "intake-plan",
+      "from": "intake",
+      "to": "plan",
+      "variant": "emphasis"
+    },
+    {
+      "id": "plan-generate",
+      "from": "plan",
+      "to": "generate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "plan-approve",
+      "from": "plan",
+      "to": "approve",
+      "label": "approval on: exit 3",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "generate-checks",
+      "from": "generate",
+      "to": "checks",
+      "variant": "emphasis"
+    },
+    {
+      "id": "checks-rundir",
+      "from": "checks",
+      "to": "rundir",
+      "label": "kept / dropped",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "checks-measure",
+      "from": "checks",
+      "to": "measure",
+      "variant": "emphasis"
+    },
+    {
+      "id": "measure-gate",
+      "from": "measure",
+      "to": "gate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gate-release",
+      "from": "gate",
+      "to": "release",
+      "label": "pass",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gate-shortfall",
+      "from": "gate",
+      "to": "shortfall",
+      "label": "fail",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "gate-refill",
+      "from": "gate",
+      "to": "generate",
+      "label": "refill short cells",
+      "variant": "dashed",
+      "role": "return"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Stage 3",
+      "items": [
+        "Each candidate goes through the six checks",
+        "See checks-flow.html for L1 to L6"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "When the refill loop stops",
+      "items": [
+        "All thresholds met: release written",
+        "Safety-scan violation: stop, can't be waived",
+        "No short cells, budget used up, or max_rounds reached: stop with a shortfall report"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Approval",
+      "items": [
+        "With approve_coverage_plan on, the run stops (exit 3) until a person approves the plan, then you run again"
+      ]
+    }
+  ]
+}

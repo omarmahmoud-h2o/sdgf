@@ -1,0 +1,319 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "The Six Checks",
+    "subtitle": "One candidate, in order L1 to L6; it stops at the first check it fails",
+    "output": "docs/diagrams/checks-flow.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/omarmahmoud-h2o/DS2_BB",
+      "provider": "github",
+      "revision": "ad5a253998bbe66cd92dc5632ed9c601f9d81025"
+    },
+    "legend": {
+      "entries": {
+        "backend": {
+          "label": "Generator step"
+        },
+        "security": {
+          "label": "Check"
+        },
+        "messagebus": {
+          "label": "Re-prompt"
+        },
+        "external": {
+          "label": "Not kept"
+        },
+        "database": {
+          "label": "Kept records"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "gen",
+      "label": "Generator"
+    },
+    {
+      "id": "back",
+      "label": "If it fails: sent back"
+    },
+    {
+      "id": "drop",
+      "label": "If it fails: dropped",
+      "variant": "exception"
+    },
+    {
+      "id": "result",
+      "label": "Result"
+    }
+  ],
+  "mainPath": [
+    "generate",
+    "l1",
+    "l2",
+    "l3",
+    "l4",
+    "l5",
+    "l6",
+    "kept"
+  ],
+  "nodes": [
+    {
+      "id": "generate",
+      "lane": "gen",
+      "col": 0,
+      "type": "backend",
+      "label": "Write candidate",
+      "sublabel": "prompt + fixed facts",
+      "width": 150
+    },
+    {
+      "id": "sentback",
+      "lane": "gen",
+      "col": 1,
+      "type": "messagebus",
+      "label": "Sent back",
+      "sublabel": "from L1, L2, L5 or L6",
+      "width": 170,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/validate/repair.py",
+          "line": 135,
+          "end_line": 227
+        }
+      ]
+    },
+    {
+      "id": "l1",
+      "lane": "back",
+      "col": 0,
+      "type": "security",
+      "label": "L1 Shape",
+      "sublabel": "fields, turns",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/validate/l1_schema.py",
+          "line": 119,
+          "end_line": 150
+        }
+      ]
+    },
+    {
+      "id": "l2",
+      "lane": "back",
+      "col": 1,
+      "type": "security",
+      "label": "L2 Rules",
+      "sublabel": "label rule, hooks",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/validate/l2_rules.py",
+          "line": 171,
+          "end_line": 200
+        }
+      ]
+    },
+    {
+      "id": "l3",
+      "lane": "drop",
+      "col": 2,
+      "type": "security",
+      "label": "L3 Safety scan",
+      "sublabel": "PII, secrets, toxicity",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/validate/l3_governance.py",
+          "line": 105,
+          "end_line": 199
+        }
+      ]
+    },
+    {
+      "id": "l4",
+      "lane": "drop",
+      "col": 3,
+      "type": "security",
+      "label": "L4 Copy check",
+      "sublabel": "seeds, held-out, kept",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/validate/l4_overlap.py",
+          "line": 301,
+          "end_line": 460
+        }
+      ]
+    },
+    {
+      "id": "l5",
+      "lane": "back",
+      "col": 4,
+      "type": "security",
+      "label": "L5 Blind judge",
+      "sublabel": "1 call, label hidden",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/validate/l5_judge.py",
+          "line": 119,
+          "end_line": 314
+        }
+      ]
+    },
+    {
+      "id": "l6",
+      "lane": "back",
+      "col": 5,
+      "type": "security",
+      "label": "L6 Extra votes",
+      "sublabel": "K calls if flagged",
+      "width": 150,
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/validate/l6_consistency.py",
+          "line": 98,
+          "end_line": 298
+        }
+      ]
+    },
+    {
+      "id": "dropped",
+      "lane": "result",
+      "col": 2,
+      "type": "external",
+      "label": "Dropped",
+      "sublabel": "logged in drops.jsonl",
+      "width": 150
+    },
+    {
+      "id": "review",
+      "lane": "result",
+      "col": 4,
+      "type": "external",
+      "label": "Review queue",
+      "sublabel": "a person decides",
+      "width": 150
+    },
+    {
+      "id": "kept",
+      "lane": "result",
+      "col": 5,
+      "type": "database",
+      "label": "Kept",
+      "sublabel": "accepted.jsonl",
+      "width": 150
+    }
+  ],
+  "edges": [
+    {
+      "id": "gen-l1",
+      "from": "generate",
+      "to": "l1",
+      "label": "candidate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "l1-l2",
+      "from": "l1",
+      "to": "l2",
+      "variant": "emphasis"
+    },
+    {
+      "id": "l2-l3",
+      "from": "l2",
+      "to": "l3",
+      "variant": "emphasis"
+    },
+    {
+      "id": "l3-l4",
+      "from": "l3",
+      "to": "l4",
+      "variant": "emphasis"
+    },
+    {
+      "id": "l4-l5",
+      "from": "l4",
+      "to": "l5",
+      "variant": "emphasis"
+    },
+    {
+      "id": "l5-l6",
+      "from": "l5",
+      "to": "l6",
+      "variant": "emphasis"
+    },
+    {
+      "id": "l6-kept",
+      "from": "l6",
+      "to": "kept",
+      "label": "pass",
+      "variant": "emphasis"
+    },
+    {
+      "id": "l3-drop",
+      "from": "l3",
+      "to": "dropped",
+      "label": "found",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "l5-review",
+      "from": "l5",
+      "to": "review",
+      "label": "unsure, review on",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "back-gen",
+      "from": "sentback",
+      "to": "generate",
+      "label": "re-prompt + errors",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "l4-drop",
+      "from": "l4",
+      "to": "dropped",
+      "label": "near-copy",
+      "variant": "security",
+      "role": "error"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Sent back",
+      "items": [
+        "Same prompt and fixed facts, plus one line per error",
+        "Used by L1, L2, L5, L6",
+        "After 2 failed re-prompts the candidate is dropped"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Dropped at once",
+      "items": [
+        "L3 and L4 never re-prompt",
+        "Telling the model what it leaked teaches it to hide it"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Cost",
+      "items": [
+        "L1–L4: free, run first",
+        "L5: 1 judge call",
+        "L6: up to K calls, only for flagged candidates"
+      ]
+    }
+  ]
+}

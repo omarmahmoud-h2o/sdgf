@@ -6,8 +6,13 @@ means), an optional `hooks.py` (the task's checkable rules in code) and a `seeds
 The framework handles coverage planning, generation, the six-layer validation cascade,
 evaluation, the release gate and provenance. The design is in
 [../FRAMEWORK_DESIGN.md](../FRAMEWORK_DESIGN.md); section numbers (§) below refer to it.
-[docs/framework.md](docs/framework.md) explains the architecture, what each validation
-layer checks, and what a new use case needs.
+Start with [docs/overview.md](docs/overview.md) for what sdgf produces and what it can't
+guarantee. [docs/how-it-works.md](docs/how-it-works.md) walks through a run and each of the
+six checks. [docs/new-use-case.md](docs/new-use-case.md) explains how to set up a new
+dataset. Terms are defined in [CONTEXT.md](CONTEXT.md).
+[docs/sdgf-guide.html](docs/sdgf-guide.html) is all three in one interactive page that works
+offline: open it in a browser. It is generated from the markdown, so edit the `.md` files
+and rerun `python docs/build_guide.py` (needs the `docs` extra).
 
 The first use case is the Financial Advice Guardrail (FAG), in [tasks/fag/](tasks/fag/),
 a `label_first` task: code fixes the label and the model writes matching text. The second,

@@ -1,0 +1,470 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "sdgf Pipeline Architecture",
+    "subtitle": "One task spec to a gated, versioned dataset release: code decides, the model writes",
+    "output": "docs/diagrams/architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/omarmahmoud-h2o/DS2_BB",
+      "provider": "github",
+      "revision": "ad5a253998bbe66cd92dc5632ed9c601f9d81025"
+    },
+    "legend": {
+      "entries": {
+        "frontend": {
+          "label": "Entry point"
+        },
+        "backend": {
+          "label": "sdgf component"
+        },
+        "security": {
+          "label": "The six checks"
+        },
+        "database": {
+          "label": "Files on disk"
+        },
+        "external": {
+          "label": "External provider"
+        }
+      }
+    }
+  },
+  "components": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "sdgf CLI",
+      "sublabel": "plan · run · release",
+      "pos": [
+        40,
+        100
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/cli.py",
+          "line": 329,
+          "end_line": 356,
+          "label": "cmd_release"
+        },
+        {
+          "path": "sdgf/src/sdgf/cli.py",
+          "line": 405,
+          "end_line": 410
+        }
+      ]
+    },
+    {
+      "id": "compile",
+      "type": "backend",
+      "label": "Stage 0 · Intake",
+      "sublabel": "schema + seed/tool gates",
+      "pos": [
+        300,
+        100
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "tag": "spec_version",
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/spec/compile.py",
+          "line": 114,
+          "end_line": 160,
+          "label": "compile_spec"
+        }
+      ]
+    },
+    {
+      "id": "plan",
+      "type": "backend",
+      "label": "Stage 1 · Coverage",
+      "sublabel": "axes × constraints → quotas",
+      "pos": [
+        560,
+        100
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/coverage/plan.py",
+          "line": 267,
+          "end_line": 329,
+          "label": "build_plan"
+        }
+      ]
+    },
+    {
+      "id": "generator",
+      "type": "backend",
+      "label": "Stage 2 · Generate",
+      "sublabel": "scheduler + prompt + merge",
+      "pos": [
+        820,
+        100
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/generate/generator.py",
+          "line": 176,
+          "end_line": 250,
+          "label": "Generator.generate"
+        },
+        {
+          "path": "sdgf/src/sdgf/pipeline.py",
+          "line": 764,
+          "end_line": 803,
+          "label": "_candidate"
+        }
+      ]
+    },
+    {
+      "id": "models",
+      "type": "backend",
+      "label": "Model registry",
+      "sublabel": "per-stage backends + meter",
+      "pos": [
+        1080,
+        100
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/models/registry.py",
+          "line": 84,
+          "end_line": 169
+        }
+      ]
+    },
+    {
+      "id": "providers",
+      "type": "external",
+      "label": "LLM endpoints",
+      "sublabel": "OpenAI-compat · Anthropic",
+      "pos": [
+        1340,
+        100
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/models/openai_compat.py",
+          "line": 23,
+          "end_line": 30
+        },
+        {
+          "path": "sdgf/src/sdgf/models/anthropic.py",
+          "line": 60,
+          "end_line": 80
+        }
+      ]
+    },
+    {
+      "id": "cascade",
+      "type": "security",
+      "label": "Stage 3 · Validate",
+      "sublabel": "L1–L6 cascade + repair",
+      "pos": [
+        820,
+        320
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/validate/cascade.py",
+          "line": 67,
+          "end_line": 127
+        },
+        {
+          "path": "sdgf/src/sdgf/validate/repair.py",
+          "line": 135,
+          "end_line": 160,
+          "label": "RepairLoop"
+        }
+      ]
+    },
+    {
+      "id": "gate",
+      "type": "backend",
+      "label": "Stages 4–5 · Gate",
+      "sublabel": "metrics vs thresholds",
+      "pos": [
+        560,
+        320
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/pipeline.py",
+          "line": 639,
+          "end_line": 708,
+          "label": "Pipeline.release"
+        },
+        {
+          "path": "sdgf/src/sdgf/evaluation/gate.py",
+          "line": 142,
+          "end_line": 170
+        }
+      ]
+    },
+    {
+      "id": "taskdir",
+      "type": "database",
+      "label": "Task directory",
+      "sublabel": "task.yaml · hooks.py · seeds",
+      "pos": [
+        300,
+        540
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/tasks/fag/task.yaml",
+          "line": 1
+        },
+        {
+          "path": "sdgf/tasks/fag/hooks.py",
+          "line": 1
+        }
+      ]
+    },
+    {
+      "id": "release",
+      "type": "database",
+      "label": "Release dir",
+      "sublabel": "dataset + card + manifest",
+      "pos": [
+        560,
+        540
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "tag": "immutable",
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/evaluation/reports.py",
+          "line": 267,
+          "end_line": 300,
+          "label": "write_release"
+        }
+      ]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "Artefact store",
+      "sublabel": "runs/<run_id>/ jsonl",
+      "pos": [
+        820,
+        540
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "sdgf/src/sdgf/store/artefacts.py",
+          "line": 139,
+          "end_line": 230
+        },
+        {
+          "path": "sdgf/src/sdgf/pipeline.py",
+          "line": 578,
+          "end_line": 616,
+          "label": "accepted / drops"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "sdgf process (in-memory, deterministic seeds)",
+      "wraps": [
+        "cli",
+        "compile",
+        "plan",
+        "generator",
+        "models",
+        "cascade",
+        "gate"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "External model providers (data leaves host)",
+      "wraps": [
+        "providers"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Local filesystem (user-owned)",
+      "wraps": [
+        "taskdir",
+        "release",
+        "store"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "cli-compile",
+      "from": "cli",
+      "to": "compile",
+      "label": "compile_spec",
+      "variant": "emphasis"
+    },
+    {
+      "id": "taskdir-compile",
+      "from": "taskdir",
+      "to": "compile",
+      "label": "load + hash",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "compile-plan",
+      "from": "compile",
+      "to": "plan",
+      "label": "CompiledSpec",
+      "variant": "emphasis"
+    },
+    {
+      "id": "plan-gen",
+      "from": "plan",
+      "to": "generator",
+      "label": "cells×quotas",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gen-models",
+      "from": "generator",
+      "to": "models",
+      "label": "call(prompt)"
+    },
+    {
+      "id": "models-providers",
+      "from": "models",
+      "to": "providers",
+      "label": "HTTPS / SDK",
+      "variant": "security"
+    },
+    {
+      "id": "gen-cascade",
+      "from": "generator",
+      "to": "cascade",
+      "label": "candidate",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "cascade-models",
+      "from": "cascade",
+      "to": "models",
+      "label": "L5/L6 judge",
+      "fromSide": "right",
+      "toSide": "bottom"
+    },
+    {
+      "id": "cascade-store",
+      "from": "cascade",
+      "to": "store",
+      "label": "accept | drop",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "cascade-gate",
+      "from": "cascade",
+      "to": "gate",
+      "label": "accepted",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gate-release",
+      "from": "gate",
+      "to": "release",
+      "label": "only on pass",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Validation layers",
+      "items": [
+        "L1 schema, L2 label_rule + hooks: repairable",
+        "L3 governance (PII, secrets) and L4 overlap: hard drop",
+        "L5 blind judge, L6 K-vote consistency on escalations",
+        "fail_repairable re-prompts the same recipe ≤ repair_tries"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Gate and refill",
+      "items": [
+        "Fidelity, κ, coverage, balance, diversity, overlap, cost, yield",
+        "Unmeasured thresholded metric fails unless waived",
+        "Fail: shortfall report, refill short cells ≤ max_rounds",
+        "Governance violations can't be waived"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Supporting components",
+      "items": [
+        "Tool gateway: allowlist, budgets, cache, sensitivity labels",
+        "HITL: plan approval (exit 3), review queue, gold set",
+        "Judge calibration: trusted only if κ and ECE pass",
+        "Task types: classification_spans, sft_qa"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Trust and provenance",
+      "items": [
+        "API keys only via api_key_env",
+        "Held-out paths passed at run time, never saved",
+        "Every record carries _provenance per layer attempt",
+        "governance_report lists external endpoints"
+      ]
+    }
+  ]
+}
