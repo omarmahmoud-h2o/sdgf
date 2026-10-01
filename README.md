@@ -164,6 +164,10 @@ This section is what the judge scores. It compiles into a typed output schema (Â
   `min` and `max` (at most 255 integers).
 - `reason_required`: `never`, `flagged` or `always`. Any value other than `never` needs
   `models.fallback_judge`.
+- `judge_context`: optional text the judge reads as its `## Context` in place of
+  `task.description`, which is written for the generator. Use it for domain definitions
+  the judge needs without the writer's instructions. Unset, the judge reads
+  `task.description`. The generation prompt never contains it.
 
 The judge prompt never contains the intended label.
 

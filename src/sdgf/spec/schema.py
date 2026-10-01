@@ -141,6 +141,9 @@ class RubricSection(_Section):
     verdict: Verdict
     criteria: list[Criterion] = Field(default_factory=list)
     reason_required: Literal["never", "flagged", "always"] = "never"
+    # The judge's "## Context", in place of task.description (which is written for
+    # the generator). Unset means the judge reads task.description, as before.
+    judge_context: str | None = None
 
     @field_validator("criteria")
     @classmethod

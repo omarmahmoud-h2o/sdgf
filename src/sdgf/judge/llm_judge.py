@@ -98,7 +98,10 @@ class LLMJudge(Judge):
         task_type: TaskType | None = None,
         **kwargs: Any,
     ) -> LLMJudge:
-        """A judge for a compiled spec, using models.<stage> for tokens and temperature."""
+        """A judge for a compiled spec, using models.<stage> for tokens and temperature.
+
+        Its context is rubric.judge_context when the spec sets one, else task.description.
+        """
         spec = compiled.spec
         task_type = task_type or REGISTRY.resolve(spec.task)
         config = getattr(spec.models, stage, None)
@@ -106,7 +109,7 @@ class LLMJudge(Judge):
             kwargs.setdefault("max_tokens", config.max_tokens)
             kwargs.setdefault("temperature", config.temperature)
         kwargs.setdefault("fields", task_type.judge_fields())
-        kwargs.setdefault("context", spec.task.description)
+        kwargs.setdefault("context", spec.rubric.judge_context or spec.task.description)
         kwargs.setdefault("stage", stage)
         return cls(compile_rubric(spec.rubric), backend, **kwargs)
 

@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 
@@ -230,3 +231,67 @@ def test_fag_prompt_blind_to_label_and_label_encoding_fields(fag):
         section = json.dumps(record_section(a))
         for key in ("label", "advice_tier", "severity", "signal_categories", "problematic"):
             assert f'"{key}' not in section
+
+
+# ── judge_context ────────────────────────────────────────────────
+
+JUDGE_CONTEXT = "Judge-only definitions: a breach is advice about the customer's own position."
+
+
+def with_judge_context(fag, text):
+    spec = fag.spec.model_copy(
+        update={"rubric": fag.spec.rubric.model_copy(update={"judge_context": text})}
+    )
+    return dataclasses.replace(fag, spec=spec)
+
+
+def test_judge_context_unset_falls_back_to_task_description(fag):
+    assert fag.spec.rubric.judge_context is None
+    judge = LLMJudge.from_spec(fag, MockBackend([fag_reply()]))
+    assert judge.context == fag.spec.task.description.strip()
+    assert "## Context\n" + fag.spec.task.description.strip() in judge.static_prefix
+
+
+def test_judge_context_replaces_task_description_in_judge_prompt_only(fag):
+    from sdgf.generate.prompts import build_static_prefix
+    from sdgf.tasktypes.registry import REGISTRY
+
+    compiled = with_judge_context(fag, JUDGE_CONTEXT)
+    backend = MockBackend([fag_reply()], cycle=True)
+    judge = LLMJudge.from_spec(compiled, backend)
+    judge.judge(fag.seeds[0])
+    prompt = backend.calls[0].prompt
+    description = fag.spec.task.description.strip()
+    assert "## Context\n" + JUDGE_CONTEXT in prompt
+    assert description not in prompt
+
+    generation = build_static_prefix(compiled, REGISTRY.resolve(compiled.spec.task), [])
+    assert description in generation
+    assert JUDGE_CONTEXT not in generation
+
+
+def test_judge_context_prompt_still_blind_to_the_label(fag):
+    compiled = with_judge_context(fag, JUDGE_CONTEXT)
+    backend = MockBackend([fag_reply()], cycle=True)
+    judge = LLMJudge.from_spec(compiled, backend)
+    for seed in fag.seeds:
+        judge.judge(seed)
+        judge.judge({**seed, "label": not seed["label"]})
+        assert backend.calls[-2].prompt == backend.calls[-1].prompt
+        assert '"label"' not in json.dumps(record_section(backend.calls[-1].prompt))
+
+
+def test_judge_context_from_yaml(tmp_path):
+    import shutil
+
+    import yaml
+
+    task_dir = tmp_path / "fag"
+    shutil.copytree(FAG_TASK.parent, task_dir)
+    path = task_dir / "task.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["rubric"]["judge_context"] = JUDGE_CONTEXT
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    compiled = compile_spec(path)
+    assert compiled.spec.rubric.judge_context == JUDGE_CONTEXT
+    assert LLMJudge.from_spec(compiled, MockBackend([fag_reply()])).context == JUDGE_CONTEXT
