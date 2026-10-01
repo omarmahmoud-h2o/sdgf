@@ -9,7 +9,7 @@ from sdgf.judge.llm_judge import RECORD_HEADER, LLMJudge, judge_view
 from sdgf.models.base import ModelResponse
 from sdgf.models.mock import MockBackend
 from sdgf.spec.compile import compile_spec
-from sdgf.spec.schema import RubricSection
+from sdgf.spec.schema import RubricExample, RubricSection
 from sdgf.tasktypes.base import TaskType
 from sdgf.tasktypes.registry import get_task_type
 
@@ -295,3 +295,97 @@ def test_judge_context_from_yaml(tmp_path):
     compiled = compile_spec(path)
     assert compiled.spec.rubric.judge_context == JUDGE_CONTEXT
     assert LLMJudge.from_spec(compiled, MockBackend([fag_reply()])).context == JUDGE_CONTEXT
+
+
+# ── rubric.examples ──────────────────────────────────────────────
+
+EXAMPLES = [
+    RubricExample(
+        record={"question": "Is 2 even?", "answer": "Yes."},
+        verdict="yes",
+        scores={"tier": "A", "realism": 5},
+        note="A correct answer.",
+    ),
+    RubricExample(record={"question": "Is 3 even?"}, verdict="no"),
+]
+
+
+def test_examples_render_in_static_prefix_before_the_record():
+    judge, backend = make([reply()], examples=EXAMPLES)
+    judge.judge(RECORD)
+    prompt = backend.calls[0].prompt
+    assert prompt.startswith(judge.static_prefix)
+    section = judge.static_prefix.split("## Worked examples\n", 1)[1]
+    assert judge.static_prefix.index("## Rubric") < judge.static_prefix.index("## Worked")
+    assert '### Example 1\nRecord: {"answer": "Yes.", "question": "Is 2 even?"}' in section
+    assert 'Expected: {"scores": {"realism": 5, "tier": "A"}, "verdict": "yes"}' in section
+    assert "Why: A correct answer." in section
+    assert '### Example 2\nRecord: {"question": "Is 3 even?"}\nExpected: {"verdict": "no"}' in (
+        section
+    )
+    assert prompt.index("## Worked examples") < prompt.index(RECORD_HEADER)
+    assert record_section(prompt) == {"question": "Q?", "answer": "A."}
+
+
+def test_no_examples_no_section():
+    judge, _ = make([reply()])
+    assert "## Worked examples" not in judge.static_prefix
+
+
+def test_examples_may_show_only_judge_fields_and_known_verdicts():
+    with pytest.raises(JudgeError, match="may not see"):
+        make([reply()], examples=[RubricExample(record={"label": "yes"}, verdict="yes")])
+    with pytest.raises(JudgeError, match="unknown verdict"):
+        make([reply()], examples=[RubricExample(record={"question": "Q"}, verdict="maybe")])
+
+
+def with_examples(fag, examples):
+    spec = fag.spec.model_copy(
+        update={"rubric": fag.spec.rubric.model_copy(update={"examples": examples})}
+    )
+    return dataclasses.replace(fag, spec=spec)
+
+
+def fag_examples(fag):
+    seed = fag.seeds[0]
+    verdict = fag.spec.rubric.verdict.values[0]
+    return [RubricExample(record={"messages": seed["messages"]}, verdict=verdict, note="N.")]
+
+
+def test_examples_in_judge_prompt_only_and_label_still_blind(fag):
+    from sdgf.generate.prompts import build_static_prefix
+    from sdgf.tasktypes.registry import REGISTRY
+
+    compiled = with_examples(fag, fag_examples(fag))
+    backend = MockBackend([fag_reply()], cycle=True)
+    judge = LLMJudge.from_spec(compiled, backend)
+    assert judge.examples == tuple(compiled.spec.rubric.examples)
+    for seed in fag.seeds:
+        judge.judge(seed)
+        judge.judge({**seed, "label": not seed["label"]})
+        assert backend.calls[-2].prompt == backend.calls[-1].prompt
+        assert "## Worked examples" in backend.calls[-1].prompt
+        assert '"label"' not in json.dumps(record_section(backend.calls[-1].prompt))
+    generation = build_static_prefix(compiled, REGISTRY.resolve(compiled.spec.task), [])
+    assert "Worked examples" not in generation and "Why: N." not in generation
+
+
+def test_examples_from_yaml(tmp_path):
+    import shutil
+
+    import yaml
+
+    task_dir = tmp_path / "fag"
+    shutil.copytree(FAG_TASK.parent, task_dir)
+    path = task_dir / "task.yaml"
+    data = yaml.safe_load(path.read_text())
+    verdict = data["rubric"]["verdict"]["values"][0]
+    data["rubric"]["examples"] = [
+        {"record": {"messages": [{"role": "customer", "content": "Hi"}]}, "verdict": verdict}
+    ]
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    compiled = compile_spec(path)
+    judge = LLMJudge.from_spec(compiled, MockBackend([fag_reply()]))
+    assert '### Example 1\nRecord: {"messages": [{"content": "Hi", "role": "customer"}]}' in (
+        judge.static_prefix
+    )

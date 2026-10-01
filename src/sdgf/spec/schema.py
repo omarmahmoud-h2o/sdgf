@@ -137,6 +137,25 @@ class Verdict(_Section):
         return self
 
 
+class RubricExample(_Section):
+    """A judge-only worked example: a record view and the verdict it should get.
+
+    Fictional only; stage 0 scans every example for PII and toxicity like the seeds,
+    and checks that `record` holds only fields the judge is allowed to see.
+    """
+
+    record: dict[str, Any] = Field(min_length=1)
+    verdict: str = Field(min_length=1)
+    scores: dict[str, Any] = Field(default_factory=dict)
+    note: str = ""  # why this is the verdict, shown to the judge
+
+
+def _criterion_accepts(c: Criterion, value: Any) -> bool:
+    if c.values is not None:
+        return value in c.values
+    return isinstance(value, int) and not isinstance(value, bool) and c.min <= value <= c.max
+
+
 class RubricSection(_Section):
     verdict: Verdict
     criteria: list[Criterion] = Field(default_factory=list)
@@ -144,6 +163,8 @@ class RubricSection(_Section):
     # The judge's "## Context", in place of task.description (which is written for
     # the generator). Unset means the judge reads task.description, as before.
     judge_context: str | None = None
+    # Rendered in the judge's static prefix only; the generation prompt never sees them.
+    examples: list[RubricExample] = Field(default_factory=list)
 
     @field_validator("criteria")
     @classmethod
@@ -153,6 +174,19 @@ class RubricSection(_Section):
         if dupes:
             raise ValueError(f"duplicate criterion names: {dupes}")
         return v
+
+    @model_validator(mode="after")
+    def _examples_fit_rubric(self) -> RubricSection:
+        criteria = {c.name: c for c in self.criteria}
+        for i, ex in enumerate(self.examples):
+            if ex.verdict not in self.verdict.values:
+                raise ValueError(f"examples[{i}]: verdict {ex.verdict!r} is not a verdict value")
+            for name, value in ex.scores.items():
+                if name not in criteria:
+                    raise ValueError(f"examples[{i}]: scores names unknown criterion {name!r}")
+                if not _criterion_accepts(criteria[name], value):
+                    raise ValueError(f"examples[{i}]: scores.{name} {value!r} not allowed")
+        return self
 
 
 # ── seeds ────────────────────────────────────────────────────────

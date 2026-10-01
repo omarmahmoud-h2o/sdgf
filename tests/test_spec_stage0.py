@@ -160,3 +160,50 @@ def test_temperature_zero_is_fine_when_l6_is_off(tmp_path):
     )
     write_task(tmp_path, yaml_text=yaml_text)
     compile_spec(tmp_path)
+
+
+# ── rubric.examples ──────────────────────────────────────────────
+
+
+def with_examples(*examples):
+    rubric = "rubric:\n  verdict:\n    values: [pass, fail]\n"
+    block = "  examples:\n" + "".join(
+        f"    - {json.dumps({'verdict': 'pass', **ex})}\n" for ex in examples
+    )
+    return TASK_YAML.replace(rubric, rubric + block)
+
+
+def test_clean_examples_compile(tmp_path):
+    ex = {"record": {"messages": [{"role": "customer", "content": "Hi"}]}, "note": "Fine."}
+    write_task(tmp_path, yaml_text=with_examples(ex))
+    (example,) = compile_spec(tmp_path).spec.rubric.examples
+    assert example.verdict == "pass" and example.note == "Fine."
+
+
+@pytest.mark.parametrize(
+    "example, where",
+    [
+        ({"record": {"messages": [{"content": "My TFN is 000 000 000."}]}}, "record.messages"),
+        ({"record": {"messages": []}, "note": "Email jane@example.test"}, "note"),
+    ],
+)
+def test_example_with_pii_is_rejected(tmp_path, example, where):
+    write_task(tmp_path, yaml_text=with_examples(example))
+    (problem,) = problems_of(tmp_path)
+    assert problem.startswith("rubric.examples[0] fails pii scan: rule ")
+    assert f"at {where}" in problem
+    assert "000 000 000" not in problem and "jane@" not in problem
+
+
+def test_example_with_toxicity_is_rejected(tmp_path):
+    write_task(tmp_path, yaml_text=with_examples({"record": {"messages": []}, "note": "idiot"}))
+    (problem,) = problems_of(tmp_path)
+    assert problem.startswith("rubric.examples[0] fails toxicity scan")
+
+
+def test_example_may_not_show_the_label_or_spans(tmp_path):
+    ex = {"record": {"messages": [], "label": True, "spans": []}}
+    write_task(tmp_path, yaml_text=with_examples({"record": {"messages": []}}, ex))
+    (problem,) = problems_of(tmp_path)
+    assert problem.startswith("rubric.examples[1]: record has fields the judge may not see")
+    assert "['label', 'spans']" in problem and "allowed: ['messages']" in problem

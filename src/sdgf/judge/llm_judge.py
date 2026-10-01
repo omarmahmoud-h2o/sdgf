@@ -6,8 +6,10 @@ spans that justify it, or pipeline-private "_" keys. So the prompt for a record 
 same whatever its intended label is, and L5 fidelity is a real check rather than an
 echo of the recipe.
 
-The prompt keeps static content first (instructions, context, rubric, schema) and the
-record last, like the generation prompt, so prefix caching works across records.
+The prompt keeps static content first (instructions, context, rubric, worked examples,
+schema) and the record last, like the generation prompt, so prefix caching works across
+records. Worked examples (rubric.examples) are the same for every record, so showing
+their verdicts tells the judge nothing about the record being judged.
 
 A generative LLMJudge can also write text, so the same class serves as the fallback
 reason-writing judge (explain) behind a decision model such as Jev that can't.
@@ -30,6 +32,7 @@ from sdgf.judge.interface import (
 )
 from sdgf.models.base import ModelBackend
 from sdgf.spec.compile import CompiledSpec
+from sdgf.spec.schema import RubricExample
 from sdgf.tasktypes.base import TaskType
 from sdgf.tasktypes.registry import REGISTRY
 
@@ -58,6 +61,20 @@ def _field_lines(schema: JudgeSchema) -> list[str]:
     return lines
 
 
+def _example_lines(i: int, example: RubricExample) -> str:
+    expected: dict[str, Any] = {"verdict": example.verdict}
+    if example.scores:
+        expected["scores"] = example.scores
+    lines = [
+        f"### Example {i}",
+        f"Record: {_dumps(example.record)}",
+        f"Expected: {_dumps(expected)}",
+    ]
+    if example.note.strip():
+        lines.append(f"Why: {example.note.strip()}")
+    return "\n".join(lines)
+
+
 class LLMJudge(Judge):
     name = "llm"
     writes_reasons = True
@@ -73,6 +90,7 @@ class LLMJudge(Judge):
         temperature: float = 0.0,
         parse_retries: int = 1,
         stage: str | None = None,
+        examples: Iterable[RubricExample] = (),
     ):
         super().__init__(schema)
         if parse_retries < 0:
@@ -86,6 +104,13 @@ class LLMJudge(Judge):
         self.temperature = temperature
         self.parse_retries = parse_retries
         self.stage = stage  # the models stage this judge calls, for provenance
+        self.examples = tuple(examples)
+        for i, ex in enumerate(self.examples):
+            extra = sorted(set(ex.record) - set(self.fields))
+            if extra:
+                raise JudgeError(f"example {i} shows fields the judge may not see: {extra}")
+            if ex.verdict not in self.schema.verdict_values:
+                raise JudgeError(f"example {i} has unknown verdict {ex.verdict!r}")
         self.static_prefix = self._static_prefix()
 
     @classmethod
@@ -100,7 +125,8 @@ class LLMJudge(Judge):
     ) -> LLMJudge:
         """A judge for a compiled spec, using models.<stage> for tokens and temperature.
 
-        Its context is rubric.judge_context when the spec sets one, else task.description.
+        Its context is rubric.judge_context when the spec sets one, else task.description,
+        and it shows rubric.examples as worked examples.
         """
         spec = compiled.spec
         task_type = task_type or REGISTRY.resolve(spec.task)
@@ -111,6 +137,7 @@ class LLMJudge(Judge):
         kwargs.setdefault("fields", task_type.judge_fields())
         kwargs.setdefault("context", spec.rubric.judge_context or spec.task.description)
         kwargs.setdefault("stage", stage)
+        kwargs.setdefault("examples", spec.rubric.examples)
         return cls(compile_rubric(spec.rubric), backend, **kwargs)
 
     # ── prompts ──────────────────────────────────────────────────
@@ -124,6 +151,13 @@ class LLMJudge(Judge):
         if self.context:
             parts.append("## Context\n" + self.context)
         parts.append("## Rubric\n" + "\n".join(_field_lines(self.schema)))
+        if self.examples:
+            parts.append(
+                "## Worked examples\n"
+                "Fictional records showing how the rubric applies. They are not the record "
+                "to judge.\n\n"
+                + "\n\n".join(_example_lines(i, ex) for i, ex in enumerate(self.examples, 1))
+            )
         return "\n\n".join(parts)
 
     def _record_section(self, record: Mapping[str, Any]) -> str:

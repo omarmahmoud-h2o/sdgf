@@ -132,6 +132,27 @@ def test_rubric_criterion_scale_limits():
     error_paths(data)
 
 
+@pytest.mark.parametrize(
+    "example, needle",
+    [
+        ({"record": {"messages": []}, "verdict": "maybe"}, "not a verdict value"),
+        ({"record": {"messages": []}, "verdict": "pass", "scores": {"nope": 1}}, "unknown"),
+        ({"record": {"messages": []}, "verdict": "pass", "scores": {"realism": 9}}, "9"),
+        ({"record": {"messages": []}, "verdict": "pass", "scores": {"realism": True}}, "True"),
+        ({"record": {}, "verdict": "pass"}, "record"),
+    ],
+)
+def test_rubric_examples_must_fit_the_rubric(example, needle):
+    data = spec()
+    data["rubric"]["criteria"] = [{"name": "realism", "min": 1, "max": 5}]
+    data["rubric"]["examples"] = [example]
+    paths, message = error_paths(data)
+    assert paths[0].startswith("rubric") and needle in message
+    data["rubric"]["examples"] = [{**example, "verdict": "pass", "scores": {"realism": 3}}]
+    if example["record"]:
+        assert parse_spec(data).rubric.examples[0].scores == {"realism": 3}
+
+
 def test_layers_must_be_ordered_and_known():
     data = spec(validation={"layers": ["L2", "L1"]})
     paths, _ = error_paths(data)

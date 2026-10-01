@@ -8,7 +8,8 @@ compile_spec also runs the stage 0 gates, so a bad spec fails before any spend:
 every seed is re-scanned with the PII and toxicity scanners of the task's governance
 profile, every listed tool must exist in the tool registry, and every release threshold
 must be set (no silent gate defaults), and L6 must not be set up to cast K identical
-votes. Problems are collected and raised together.
+votes. Judge-only worked examples (rubric.examples) are scanned like seeds and may hold
+only fields the judge is allowed to see. Problems are collected and raised together.
 
 L6 with consistency_k > 1 and every validation.consistency temperature 0 is rejected
 rather than warned about: L6 votes on one model stage, so at temperature 0 its K votes
@@ -32,6 +33,8 @@ from sdgf.governance.toxicity import build_toxicity_scanner
 from sdgf.spec.hooks import TaskHooks
 from sdgf.spec.loader import load_task
 from sdgf.spec.schema import TaskSpec
+from sdgf.tasktypes.base import TaskTypeError
+from sdgf.tasktypes.registry import REGISTRY
 
 
 class Stage0Error(ValueError):
@@ -90,16 +93,62 @@ def seed_gate_problems(
         profile = profile_for(spec)
     except GovernanceProfileError as e:
         return [f"governance: {e}"]
-    scanners = (
-        ("pii", build_pii_scanner(profile, pii_engines)),
-        ("toxicity", build_toxicity_scanner(profile, toxicity_engines)),
-    )
+    scanners = _scanners(profile, pii_engines, toxicity_engines)
     problems = []
     for i, seed in enumerate(seeds):
         for kind, scanner in scanners:
             for f in scanner.scan_record(seed):
                 problems.append(
                     f"seeds: {_seed_label(i, seed)} fails {kind} scan: rule {f.rule} at {f.path}"
+                )
+    return problems
+
+
+def _scanners(profile: Any, pii_engines: Sequence[str], toxicity_engines: Sequence[str]):
+    return (
+        ("pii", build_pii_scanner(profile, pii_engines)),
+        ("toxicity", build_toxicity_scanner(profile, toxicity_engines)),
+    )
+
+
+def example_gate_problems(
+    spec: TaskSpec,
+    *,
+    pii_engines: Sequence[str] = ("regex",),
+    toxicity_engines: Sequence[str] = ("keywords",),
+) -> list[str]:
+    """Judge-only worked examples are fictional and judge-visible only.
+
+    Each rubric.examples entry is scanned like a seed (record and note, never the
+    matched text in a problem), and its record may hold only the task type's
+    judge_fields, so an example can't show the judge the label or its spans.
+    """
+    examples = spec.rubric.examples
+    if not examples:
+        return []
+    problems = []
+    try:
+        fields = set(REGISTRY.resolve(spec.task).judge_fields())
+    except TaskTypeError as e:
+        problems.append(f"rubric.examples: can't check judge fields: {e}")
+        fields = None
+    try:
+        scanners = _scanners(profile_for(spec), pii_engines, toxicity_engines)
+    except GovernanceProfileError:
+        scanners = ()  # seed_gate_problems already reports the governance problem
+    for i, ex in enumerate(examples):
+        if fields is not None:
+            extra = sorted(set(ex.record) - fields)
+            if extra:
+                problems.append(
+                    f"rubric.examples[{i}]: record has fields the judge may not see {extra}; "
+                    f"allowed: {sorted(fields)}"
+                )
+        view = {"record": ex.record, "note": ex.note}
+        for kind, scanner in scanners:
+            for f in scanner.scan_record(view):
+                problems.append(
+                    f"rubric.examples[{i}] fails {kind} scan: rule {f.rule} at {f.path}"
                 )
     return problems
 
@@ -144,6 +193,7 @@ def stage0_problems(
         *seed_gate_problems(
             spec, seeds, pii_engines=pii_engines, toxicity_engines=toxicity_engines
         ),
+        *example_gate_problems(spec, pii_engines=pii_engines, toxicity_engines=toxicity_engines),
         *tool_gate_problems(spec, tool_registry),
         *threshold_gate_problems(spec),
         *consistency_gate_problems(spec),

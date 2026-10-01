@@ -168,6 +168,12 @@ This section is what the judge scores. It compiles into a typed output schema (Â
   `task.description`, which is written for the generator. Use it for domain definitions
   the judge needs without the writer's instructions. Unset, the judge reads
   `task.description`. The generation prompt never contains it.
+- `examples`: optional judge-only worked examples. Each has a `record` (the judge's view
+  of a record, so only the task type's judge fields, never the label or spans), the
+  expected `verdict`, optional `scores` and an optional `note` saying why. They are
+  rendered under `## Worked examples` in the judge's static prefix and never in the
+  generation prompt. Use fictional content only: stage 0 scans every example for PII and
+  toxicity like the seeds, and rejects an example whose record shows other fields.
 
 The judge prompt never contains the intended label.
 
