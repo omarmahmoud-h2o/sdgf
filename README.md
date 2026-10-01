@@ -216,7 +216,10 @@ go in the spec.
 - `consistency_k` (default 5): the number of L6 votes.
 - `consistency`: `temperatures` (default `[0.7, 0.8, 0.9]`). Vote i is sampled at
   `temperatures[i % len]`, overriding the voting stage's own temperature, so K votes
-  from a temperature-0 judge don't just repeat L5's verdict.
+  from a temperature-0 judge don't just repeat L5's verdict. With L6 on and
+  `consistency_k` above 1, stage 0 rejects a list whose every temperature is 0: one
+  model at temperature 0 casts the same vote K times, at K times the cost. Use
+  `consistency_k: 1` for a single vote.
 - `escalation`: `low_confidence` (default 0.7), `on_hard_cells`, `on_contestable`, and
   `always` (default false; escalate every record, as CFA does for DS²-Instruct
   self-consistency). Escalated records go to L6. Under `answer_emergent`, L6's K answers

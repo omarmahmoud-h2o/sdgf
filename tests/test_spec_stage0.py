@@ -123,3 +123,40 @@ def test_stage0_problems_on_parsed_spec():
     c = compile_spec(FAG_DIR)
     assert stage0_problems(c.spec, c.seeds) == []
     assert stage0_problems(c.spec, [{"note": "TFN 000 000 000"}])[0].startswith("seeds: seed 0 ")
+
+
+def with_l6(*, k=5, temperatures=None):
+    lines = ["  layers: [L1, L2, L6]\n", f"  consistency_k: {k}\n"]
+    if temperatures is not None:
+        lines.append(f"  consistency:\n    temperatures: {temperatures}\n")
+    return TASK_YAML.replace("  layers: [L1, L2]\n", "".join(lines))
+
+
+@pytest.mark.parametrize("temperatures", ["[0.0]", "[0, 0.0, 0]"])
+def test_l6_with_only_temperature_zero_votes_is_rejected(tmp_path, temperatures):
+    write_task(tmp_path, yaml_text=with_l6(temperatures=temperatures))
+    (problem,) = problems_of(tmp_path)
+    assert problem.startswith("validation.consistency.temperatures: ")
+    assert "5 votes" in problem and "consistency_k: 1" in problem
+
+
+@pytest.mark.parametrize(
+    "yaml_kwargs",
+    [
+        {},  # default temperatures 0.7, 0.8, 0.9
+        {"temperatures": "[0.0, 0.7]"},  # one varied temperature is enough
+        {"k": 1, "temperatures": "[0.0]"},  # a single vote repeats nothing
+    ],
+)
+def test_l6_with_vote_diversity_or_one_vote_compiles(tmp_path, yaml_kwargs):
+    write_task(tmp_path, yaml_text=with_l6(**yaml_kwargs))
+    assert "L6" in compile_spec(tmp_path).spec.validation.layers
+
+
+def test_temperature_zero_is_fine_when_l6_is_off(tmp_path):
+    yaml_text = TASK_YAML.replace(
+        "  layers: [L1, L2]\n",
+        "  layers: [L1, L2]\n  consistency:\n    temperatures: [0.0]\n",
+    )
+    write_task(tmp_path, yaml_text=yaml_text)
+    compile_spec(tmp_path)

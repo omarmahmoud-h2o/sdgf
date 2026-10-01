@@ -7,7 +7,14 @@ seeds bytes. Each part is length-prefixed so content can't shift between parts.
 compile_spec also runs the stage 0 gates, so a bad spec fails before any spend:
 every seed is re-scanned with the PII and toxicity scanners of the task's governance
 profile, every listed tool must exist in the tool registry, and every release threshold
-must be set (no silent gate defaults). Problems are collected and raised together.
+must be set (no silent gate defaults), and L6 must not be set up to cast K identical
+votes. Problems are collected and raised together.
+
+L6 with consistency_k > 1 and every validation.consistency temperature 0 is rejected
+rather than warned about: L6 votes on one model stage, so at temperature 0 its K votes
+are one verdict repeated K times, at K times the cost, and confirm a wrong L5 verdict
+instead of challenging it (§6.4, §11). Nothing is gained by running it that way, and a
+warning is easy to miss in a long run; consistency_k: 1 is the explicit single vote.
 """
 
 from __future__ import annotations
@@ -111,6 +118,20 @@ def threshold_gate_problems(spec: TaskSpec) -> list[str]:
     return [f"thresholds.{name}: release threshold is not set" for name in spec.thresholds.unset()]
 
 
+def consistency_gate_problems(spec: TaskSpec) -> list[str]:
+    """L6 must not cast K identical votes: K > 1 at temperature 0 only (§6.4, §11)."""
+    v = spec.validation
+    if "L6" not in v.layers or v.consistency_k == 1:
+        return []
+    if any(t > 0 for t in v.consistency.temperatures):
+        return []
+    return [
+        f"validation.consistency.temperatures: every L6 vote is at temperature 0, so the "
+        f"{v.consistency_k} votes (consistency_k) would repeat one verdict; give a "
+        "temperature above 0, or set consistency_k: 1 for a single vote"
+    ]
+
+
 def stage0_problems(
     spec: TaskSpec,
     seeds: Sequence[dict[str, Any]],
@@ -125,6 +146,7 @@ def stage0_problems(
         ),
         *tool_gate_problems(spec, tool_registry),
         *threshold_gate_problems(spec),
+        *consistency_gate_problems(spec),
     ]
 
 
