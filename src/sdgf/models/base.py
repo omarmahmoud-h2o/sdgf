@@ -4,6 +4,11 @@ Every backend — local vLLM, MLX, OpenAI-compatible, Anthropic, mock — expose
 call(prompt, max_tokens, temperature, tools=None) returning a ModelResponse: the text
 (None if the model produced none) plus any tool calls the model asked for (§6.3, D4).
 
+A decision backend (Jev) answers typed questions instead of prompts: decide(state,
+questions) returning a DecisionResponse. Text backends don't implement it, a decision
+backend doesn't implement call(), and either raises a clear error when asked for the
+other, so a spec that puts a decision model on a text stage fails rather than limps.
+
 Each backend also knows its hosting ("local" or "provider_api"). Under D12 a task's
 model choice *is* its data-destination decision, so hosting is recorded per stage by
 the model registry for provenance and the governance report.
@@ -40,6 +45,16 @@ class ModelResponse:
     output_tokens: int | None = None
 
 
+@dataclass(frozen=True)
+class DecisionResponse:
+    """A decision model's typed answers to one request: {question id: answer object}."""
+
+    answers: dict[str, dict[str, Any]]
+    model: str | None = None  # the model version the service reports
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
 class ModelBackend(ABC):
     name: ClassVar[str]  # backend kind, matches ModelConfig.backend
     default_hosting: ClassVar[Hosting | None] = None  # None: the spec must declare it
@@ -65,6 +80,12 @@ class ModelBackend(ABC):
         temperature: float,
         tools: list[ToolSpec] | None = None,
     ) -> ModelResponse: ...
+
+    def decide(self, state: Any, questions: dict[str, dict[str, Any]]) -> DecisionResponse:
+        """Answer typed questions about `state`. Only decision backends implement it."""
+        raise ModelBackendError(
+            f"backend {self.name!r} is a text model: it answers prompts, not typed questions"
+        )
 
 
 class BoundedBackend(ModelBackend):
@@ -93,3 +114,7 @@ class BoundedBackend(ModelBackend):
     ) -> ModelResponse:
         with self._slots:
             return self.inner.call(prompt, max_tokens, temperature, tools)
+
+    def decide(self, state: Any, questions: dict[str, dict[str, Any]]) -> DecisionResponse:
+        with self._slots:
+            return self.inner.decide(state, questions)

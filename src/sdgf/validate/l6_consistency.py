@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from sdgf.judge.calibration import CalibrationResult, trust_for
 from sdgf.judge.interface import Judge, JudgeError, JudgeParseError
+from sdgf.judge.jev import JEV_BACKEND, JevJudge
 from sdgf.judge.llm_judge import LLMJudge, judge_view
 from sdgf.models.base import ModelBackend
 from sdgf.spec.schema import EscalationRules, GenerationMode
@@ -118,8 +119,13 @@ def vote_stage(compiled: CompiledSpec) -> str:
 
 
 def vote_judges(compiled: CompiledSpec, backend: ModelBackend) -> tuple[Judge, ...]:
-    """One blind LLMJudge per validation.consistency temperature, on the voting stage."""
+    """One blind LLMJudge per validation.consistency temperature, on the voting stage.
+
+    A decision backend (jev) has no temperature to vary, so it gets one JevJudge; stage 0
+    rejects consistency_k above 1 on it, since its K votes would repeat one verdict."""
     stage = vote_stage(compiled)
+    if backend.name == JEV_BACKEND:
+        return (JevJudge.from_spec(compiled, backend, stage=stage),)
     return tuple(
         LLMJudge.from_spec(compiled, backend, stage=stage, temperature=t)
         for t in compiled.spec.validation.consistency.temperatures

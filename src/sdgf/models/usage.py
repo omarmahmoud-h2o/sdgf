@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping
 
-from sdgf.models.base import ModelBackend, ModelResponse, ToolSpec
+from sdgf.models.base import DecisionResponse, ModelBackend, ModelResponse, ToolSpec
 from sdgf.spec.schema import ModelConfig
 
 CHARS_PER_TOKEN = 4
@@ -185,6 +185,17 @@ class MeteredBackend(ModelBackend):
         self.meter.record(self.stage, self.usage_of(prompt, tools, response))
         return response
 
+    def decide(self, state: Any, questions: dict[str, dict[str, Any]]) -> DecisionResponse:
+        response = self.inner.decide(state, questions)
+        inp, out = response.input_tokens, response.output_tokens
+        estimated = inp is None or out is None
+        if inp is None:
+            inp = estimate_tokens(json.dumps([state, questions], sort_keys=True, default=str))
+        if out is None:
+            out = estimate_tokens(json.dumps(response.answers, sort_keys=True))
+        self.meter.record(self.stage, self._usage(inp, out, estimated))
+        return response
+
     def usage_of(
         self, prompt: str, tools: list[ToolSpec] | None, response: ModelResponse
     ) -> StageUsage:
@@ -199,6 +210,9 @@ class MeteredBackend(ModelBackend):
             out = estimate_tokens(
                 (response.text or "") + (json.dumps(calls, sort_keys=True) if calls else "")
             )
+        return self._usage(inp, out, estimated)
+
+    def _usage(self, inp: int, out: int, estimated: bool) -> StageUsage:
         return StageUsage(
             calls=1,
             input_tokens=inp,

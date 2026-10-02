@@ -165,6 +165,15 @@ judge-only worked examples (a record view, the expected verdict, optional scores
 note) under `## Worked examples`. Neither ever reaches the generation prompt, and stage 0
 scans the examples for PII and toxicity like the seeds.
 
+The judge is either a text model behind `LLMJudge`, which is prompted for the rubric as
+JSON, or Jev (`backend: jev`), a decision model that answers typed questions. For Jev the
+rubric is compiled into one request per record: the verdict and each enum criterion are
+Choice questions, each integer criterion a Score (a Choice past 10 levels). The state it
+sees is the same context, worked examples and blind record view. Both return the same
+verdict, scores and confidence, so everything below applies to either. Jev's confidence
+comes from its answer distribution rather than the model's own estimate, but it is still
+untrusted until a calibration passes.
+
 | Judge result | Outcome |
 |---|---|
 | agrees, confident | pass |

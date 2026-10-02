@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from sdgf.judge.interface import Judge, JudgeError, JudgeParseError, JudgeResult, compile_rubric
-from sdgf.judge.jev import JevNotImplementedError
 from sdgf.judge.llm_judge import RECORD_HEADER, LLMJudge
 from sdgf.models.mock import MockBackend
 from sdgf.spec.compile import compile_spec
@@ -317,11 +316,34 @@ def test_fag_review_sink_used_only_when_hitl_enables_it(fag, seeds):
     assert sink.items == []
 
 
-def test_selecting_jev_as_judge_fails_clearly(fag):
-    from sdgf.judge.jev import JevJudge
+def jev_answers(verdict, conf=0.9):
+    return {
+        "verdict": {"type": "choice", "choice": verdict, "confidence": conf},
+        "advice_tier": {"type": "choice", "choice": "FACTUAL_INFORMATION", "confidence": 0.8},
+        "realism": {"type": "score", "probabilities": {"3": 1.0}, "confidence": 0.8},
+    }
 
-    with pytest.raises(JevNotImplementedError):
-        JudgeLayer.from_spec(fag, JevJudge(compile_rubric(fag.spec.rubric), None))
+
+@pytest.mark.parametrize(
+    "reply, outcome, code",
+    [
+        ((200, {"answers": jev_answers("no_breach")}), "pass", None),
+        ((200, {"answers": jev_answers("breach")}), "fail_repairable", "judge_disagrees"),
+        ((422, {"error": {"message": "state too large"}}), "fail_hard", "judge_error"),
+    ],
+)
+def test_l5_with_the_jev_judge(fag, monkeypatch, reply, outcome, code):
+    # The same L5 runs on Jev's typed answers as on an LLM judge's JSON.
+    from sdgf.judge.jev import JevBackend
+    from sdgf.judge.select import judge_from_spec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key-000")
+    backend = JevBackend("jev-1.13", transport=lambda *a: reply, sleep=lambda s: None)
+    lay = JudgeLayer.from_spec(fag, judge_from_spec(fag, backend))
+    seed = next(s for s in fag.seeds if s["label"] is False)
+    v = lay.check(seed, ValidationContext(recipe=seed))
+    assert v.outcome == outcome
+    assert (v.codes[0] if v.codes else None) == code
 
 
 def test_fag_spec_rejects_label_map_typo(fag):

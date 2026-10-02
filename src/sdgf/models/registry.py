@@ -158,7 +158,7 @@ def _register_builtins(registry: ModelRegistry) -> None:
     from sdgf.models import anthropic, mlx, openai_compat, vllm
 
     registry.register("mock", _mock_factory)
-    registry.register(jev.JEV_BACKEND, jev.factory)  # interface stub: fails clearly (§7.3)
+    registry.register(jev.JEV_BACKEND, jev.factory)  # decision model: judge stages only
     registry.register(openai_compat.OpenAICompatBackend.name, openai_compat.factory)
     registry.register(anthropic.AnthropicBackend.name, anthropic.factory)
     registry.register(vllm.VLLMBackend.name, vllm.factory)

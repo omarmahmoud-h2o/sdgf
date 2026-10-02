@@ -4,7 +4,7 @@ The generator mock sometimes writes a "no breach" conversation whose assistant a
 the §12.2 blind spot; the blind judge mock reads the conversation and says breach, so L5
 repairs it in its cell. Hard and contestable records escalate to L6 and get K judge votes,
 unless a stored calibration makes the judge trusted. Low-confidence verdicts go to the
-review stream when hitl.review_flagged is on, and a spec selecting Jev fails clearly.
+review stream when hitl.review_flagged is on, and the same run works with Jev as the L5 judge.
 """
 
 import dataclasses
@@ -16,7 +16,7 @@ import pytest
 
 from sdgf.coverage.plan import build_plan
 from sdgf.judge.calibration import CalibrationResult, CalibrationStore
-from sdgf.judge.jev import JevNotImplementedError
+from sdgf.judge.jev import JevBackend
 from sdgf.judge.llm_judge import RECORD_HEADER
 from sdgf.models.mock import MockBackend
 from sdgf.pipeline import DROPS_STREAM, REVIEW_STREAM, Pipeline, PipelineError
@@ -227,16 +227,42 @@ def test_review_is_off_by_default_so_no_review_stream(judged_run):
     assert not result.run.jsonl_path(REVIEW_STREAM).exists()
 
 
-def test_selecting_jev_fails_clearly(fag, tmp_path):
-    models = fag.spec.models
-    judge = models.judge.model_copy(update={"backend": "jev", "params": {}})
-    spec = fag.spec.model_copy(update={"models": models.model_copy(update={"judge": judge})})
-    with pytest.raises(JevNotImplementedError, match=r"models\.judge.*§7\.3"):
-        Pipeline(
-            dataclasses.replace(fag, spec=spec),
-            tmp_path,
-            model_overrides={"generator": MockBackend(["{}"])},
-        )
+def test_jev_judges_l5_end_to_end(fag, tmp_path, monkeypatch):
+    # Jev answers typed questions over the blind record; the same world decides what's true.
+    world = World()
+
+    def system_one(method, url, headers, body, timeout):
+        messages = body["state"]["record"]["messages"]
+        text = json.dumps(messages)
+        if ADVICE in text:
+            breach = True
+        else:
+            (breach,) = {v for k, v in world.truth.items() if json.dumps(k)[1:-1] in text}
+        answer = {
+            "verdict": {"type": "choice", "choice": "breach" if breach else "no_breach",
+                        "confidence": 0.95},
+            "advice_tier": {"type": "choice", "confidence": 0.9,
+                            "choice": "PERSONAL_ADVICE" if breach else "FACTUAL_INFORMATION"},
+            "realism": {"type": "score", "probabilities": {"3": 1.0}, "confidence": 0.9},
+        }
+        return 200, {"model": "jev-1.13.0", "answers": answer,
+                     "usage": {"input_tokens": 400, "output_tokens": 0}}
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key-000")
+    jev = JevBackend("jev-1.13", transport=system_one, sleep=lambda s: None)
+    pipe = Pipeline(
+        fag, tmp_path / "store", target_size=TARGET, layers=["L1", "L2", "L3", "L4", "L5"],
+        model_overrides={"generator": MockBackend(world.generate), "judge": jev},
+    )
+    result = pipe.run("jev")
+    assert result.complete and len(result.accepted) == TARGET
+    assert world.advised > 0  # advice planted in a no-breach record was caught and repaired
+    _, prov = split(result.accepted[0])
+    assert ("judge", "jev", "jev-1.13", "provider_api") in [
+        (m.stage, m.backend, m.model, m.hosting) for m in prov.models
+    ]
+    assert result.usage["stages"]["judge"]["input_tokens"] >= 400 * TARGET
+
 
 
 def test_overrides_for_stages_the_run_does_not_use_are_refused(fag, tmp_path):

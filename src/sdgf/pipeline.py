@@ -107,7 +107,7 @@ from sdgf.generate.generator import Generator
 from sdgf.hitl.queue import require_plan_approval
 from sdgf.judge.calibration import CalibrationResult, CalibrationStore
 from sdgf.judge.interface import Judge
-from sdgf.judge.llm_judge import LLMJudge
+from sdgf.judge.select import judge_from_spec
 from sdgf.generate.scheduler import Cell, Scheduler
 from sdgf.models.base import BoundedBackend, ModelBackend
 from sdgf.models.registry import StageModels, build_models
@@ -434,7 +434,7 @@ class Pipeline:
             raise PipelineError("held_out_paths needs L4 enabled")
         judge_name = None
         if "judge" in self.used_stages:
-            self.judge = LLMJudge.from_spec(self.compiled, self._bounded["judge"])
+            self.judge = judge_from_spec(self.compiled, self._bounded["judge"])
             judge_name = self._judge_id()
             if calibration is None:
                 calibration = CalibrationStore(self.store).load(
@@ -452,7 +452,7 @@ class Pipeline:
                 self.calibration = calibration
         fallback = None
         if "fallback_judge" in self.used_stages:
-            fallback = LLMJudge.from_spec(
+            fallback = judge_from_spec(
                 self.compiled, self._bounded["fallback_judge"], stage="fallback_judge"
             )
         build = {

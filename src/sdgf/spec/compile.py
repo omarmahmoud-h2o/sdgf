@@ -167,11 +167,57 @@ def threshold_gate_problems(spec: TaskSpec) -> list[str]:
     return [f"thresholds.{name}: release threshold is not set" for name in spec.thresholds.unset()]
 
 
+DECISION_BACKENDS = frozenset({"jev"})  # answer typed questions, never prompts
+
+
+def decision_model_gate_problems(spec: TaskSpec) -> list[str]:
+    """A decision model (jev) serves judge stages only: it writes no text (§7.3, D11)."""
+    m, problems = spec.models, []
+    for stage in ("generator", "expansion"):
+        cfg = getattr(m, stage)
+        if cfg is not None and cfg.backend in DECISION_BACKENDS:
+            problems.append(
+                f"models.{stage}: {cfg.backend} is a decision model and writes no text; "
+                "use it for models.judge or models.consistency_judge"
+            )
+    if spec.rubric.reason_required != "never":
+        reasoner = m.fallback_judge or m.judge
+        if reasoner is not None and reasoner.backend in DECISION_BACKENDS:
+            stage = "fallback_judge" if m.fallback_judge is not None else "judge"
+            problems.append(
+                f"models.{stage}: rubric.reason_required is {spec.rubric.reason_required!r} "
+                f"but {reasoner.backend} can't write reasons; set models.fallback_judge to a "
+                "text model"
+            )
+    v = spec.validation
+    voter = m.consistency_judge or m.judge
+    if "L6" in v.layers and voter is not None and voter.backend in DECISION_BACKENDS:
+        stage = "consistency_judge" if m.consistency_judge is not None else "judge"
+        if spec.task.generation_mode == "answer_emergent":
+            problems.append(
+                f"models.{stage}: answer_emergent L6 needs a text model to answer the question "
+                f"K times, and {voter.backend} writes no text; set models.consistency_judge to "
+                "a text model"
+            )
+        elif v.consistency_k > 1:
+            problems.append(
+                f"models.{stage}: {voter.backend} is deterministic, so L6's "
+                f"{v.consistency_k} votes (consistency_k) would repeat one verdict; set "
+                "models.consistency_judge to a text model, or consistency_k: 1"
+            )
+    return problems
+
+
+def _votes_on_decision_model(spec: TaskSpec) -> bool:
+    voter = spec.models.consistency_judge or spec.models.judge
+    return voter is not None and voter.backend in DECISION_BACKENDS
+
+
 def consistency_gate_problems(spec: TaskSpec) -> list[str]:
     """L6 must not cast K identical votes: K > 1 at temperature 0 only (§6.4, §11)."""
     v = spec.validation
-    if "L6" not in v.layers or v.consistency_k == 1:
-        return []
+    if "L6" not in v.layers or v.consistency_k == 1 or _votes_on_decision_model(spec):
+        return []  # a decision-model voter is checked by decision_model_gate_problems
     if any(t > 0 for t in v.consistency.temperatures):
         return []
     return [
@@ -197,6 +243,7 @@ def stage0_problems(
         *tool_gate_problems(spec, tool_registry),
         *threshold_gate_problems(spec),
         *consistency_gate_problems(spec),
+        *decision_model_gate_problems(spec),
     ]
 
 

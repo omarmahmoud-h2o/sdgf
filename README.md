@@ -207,13 +207,13 @@ Each stage takes these keys:
 
 | Key | Meaning |
 |---|---|
-| `backend` | `openai_compat`, `anthropic`, `vllm`, `mlx`, `mock` or `jev` (a stub, see below) |
+| `backend` | `openai_compat`, `anthropic`, `vllm`, `mlx`, `mock`, or `jev` (a decision model for judge stages only, see below) |
 | `model` | model id |
 | `hosting` | `local` or `provider_api`. It defaults from the backend, except that `openai_compat` must declare it. It is recorded in provenance and in the governance report (D12) |
 | `temperature`, `max_tokens` | sampling |
 | `concurrency` | per-stage call limit. The pool size is the largest across stages. Output is the same for a given seed at any concurrency |
 | `input_cost_per_mtok`, `output_cost_per_mtok` | USD per million tokens. Set both or neither. Unset means *unpriced*, which is not the same as free |
-| `params` | backend options. `openai_compat`: `api_base`, `api_key_env`, `top_p`, `stop`, `timeout`, `check_model`. `anthropic`: `api_key_env`, `top_p`, `thinking_headroom`, `max_tokens_cap`. `vllm`: `engine`, `top_p`, `stop`. `mlx`: `top_p`, `enable_thinking`. `mock`: `responses`, `cycle` |
+| `params` | backend options. `openai_compat`: `api_base`, `api_key_env`, `top_p`, `stop`, `timeout`, `check_model`. `anthropic`: `api_key_env`, `top_p`, `thinking_headroom`, `max_tokens_cap`. `vllm`: `engine`, `top_p`, `stop`. `mlx`: `top_p`, `enable_thinking`. `jev`: `api_base` (default `https://openrouter.ai/api`), `api_key_env` (default `OPENROUTER_API_KEY`), `timeout`, `max_retries`, `backoff`. `mock`: `responses`, `cycle` |
 
 API keys are read from the environment variable that `api_key_env` names. They never
 go in the spec.
@@ -346,9 +346,31 @@ Install an extra with `pip install -e '.[pii]'`. Model SDKs work the same way:
 uses `vllm`, and `mlx` uses `mlx` and `mlx-lm`. Each SDK is imported only at the
 backend's `setup()`.
 
-**Jev (TypeSafe System One)** is registered as the `jev` backend, but it is an
-interface stub. Selecting it raises `NotImplementedError` until its API is documented
-(§7.3, §16 Q1).
+**Jev (TypeSafe System One)** is the `jev` backend: a decision model that answers typed
+questions instead of prompts, so it can only be `models.judge` or `models.consistency_judge`.
+It defaults to OpenRouter's System One API (`POST https://openrouter.ai/api/v1/systemone`,
+key in `OPENROUTER_API_KEY`); set `params.api_base: https://api.typesafe.ai` for TypeSafe's
+own endpoint. Use the model id `jev-1.13`, or `jev-latest` for the newest release. It
+needs only the standard library.
+
+```yaml
+models:
+  judge:
+    backend: jev
+    model: jev-1.13
+    params: {api_key_env: OPENROUTER_API_KEY}
+```
+
+`JevJudge` turns any rubric into one request per record: the verdict and each enum
+criterion become a Choice question, each integer criterion a Score (or a Choice when the
+range is wider than Jev's 10 levels). The answers come back as the same verdict, scores
+and per-field confidence an LLM judge returns, so L5, L6, calibration and metrics work
+unchanged. Confidence comes from Jev's answer distribution; it still needs a calibration
+before the judge counts as trusted. Stage 0 rejects Jev as the generator or expansion
+model, as the reason writer (`reason_required` needs a text `fallback_judge`), and as the
+L6 voter with `consistency_k` above 1, since a deterministic model repeats one verdict.
+Records whose state Jev refuses (e.g. over its 32,000-token context) are judge errors for
+that record, not a crash.
 
 ## Layout
 
@@ -362,7 +384,7 @@ src/sdgf/
   tools/       registry, gateway, cache, builtin tools
   governance/  profile, PII, toxicity, secrets, entities
   validate/    cascade, L1–L6, repair (stage 3)
-  judge/       typed interface, LLM judge, Jev stub, calibration
+  judge/       typed interface, LLM judge, Jev decision judge, calibration
   evaluation/  metrics, diversity, gate, reports (stages 4–5)
   store/       artefact store, provenance
   hitl/        review queue, plan approval
