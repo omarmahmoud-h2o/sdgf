@@ -323,23 +323,23 @@ models:
     params:
       api_key_env: ANTHROPIC_API_KEY
   judge:
-    backend: openai_compat
-    model: gpt-4o-mini
+    backend: jev
+    model: jev-1.13
     hosting: provider_api
-    temperature: 0.0
-    max_tokens: 512
-    concurrency: 8
-    input_cost_per_mtok: 0.15     # check against current OpenAI pricing
-    output_cost_per_mtok: 0.60
+    # temperature: 0.0
+    # max_tokens: 512
+    # concurrency: 8
+    # input_cost_per_mtok: 0.15     # check against current OpenAI pricing
+    # output_cost_per_mtok: 0.60
     params:
-      api_base: https://api.openai.com/v1
-      api_key_env: OPENAI_API_KEY
+      api_base: https://openrouter.ai/api
+      api_key_env: OPENROUTER_API_KEY
       timeout: 120
 
 validation:
   layers: [L1, L2, L3, L4, L5, L6]
   repair_tries: 2
-  consistency_k: 5
+  consistency_k: 1
   escalation:
     low_confidence: 0.7
     on_hard_cells: true
