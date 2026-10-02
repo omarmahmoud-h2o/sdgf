@@ -21,6 +21,8 @@ SCOPES = ["corps_act", "non_corps_act"]
 
 
 def _import_scripts(*names):
+    if not SCRIPTS_DIR.is_dir():
+        pytest.skip("needs the original ../scripts/ FAG generator, which is not checked out")
     # scripts/ is read-only here: import without writing bytecode into it.
     sys.path.insert(0, str(SCRIPTS_DIR))
     dont_write, sys.dont_write_bytecode = sys.dont_write_bytecode, True

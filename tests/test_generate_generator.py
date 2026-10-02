@@ -82,6 +82,8 @@ def test_extract_json_matches_the_original(monkeypatch):
 
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     scripts = FAG_DIR.parents[2] / "scripts"
+    if not scripts.is_dir():
+        pytest.skip("needs the original ../scripts/ FAG generator, which is not checked out")
     monkeypatch.syspath_prepend(str(scripts))
     spec = importlib.util.spec_from_file_location("_orig_utils", scripts / "utils.py")
     orig = importlib.util.module_from_spec(spec)
