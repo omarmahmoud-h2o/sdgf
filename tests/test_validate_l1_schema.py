@@ -1,6 +1,7 @@
 """L1 schema/layout layer: JSON schema, turn structure and task-type validators."""
 
 import copy
+import shutil
 from pathlib import Path
 
 import pytest
@@ -11,9 +12,11 @@ from sdgf.spec.schema import TurnStructure
 from sdgf.tasktypes.classification_spans import CLASSIFICATION_SPANS
 from sdgf.validate.base import ValidationContext
 from sdgf.validate.cascade import Cascade
-from sdgf.validate.l1_schema import SchemaLayer, format_path, validator_code
+from sdgf.validate.l1_schema import SchemaLayer
 
-FAG_DIR = Path(__file__).resolve().parents[1] / "tasks" / "fag"
+SDGF_DIR = Path(__file__).resolve().parents[1]
+FAG_DIR = SDGF_DIR / "tasks" / "fag"
+CFA_DIR = SDGF_DIR / "tasks" / "cfa"
 CTX = ValidationContext()
 TURNS = TurnStructure(roles=["customer", "assistant"], first_role="customer")
 
@@ -52,28 +55,26 @@ def test_valid_record_passes(layer):
     assert verdict.passed and verdict.layer == "L1"
 
 
-def test_format_path():
-    assert format_path(["messages", 3, "content"]) == "messages[3].content"
-    assert format_path([]) is None
-    assert format_path([0, "text"]) == "[0].text"
-
-
 # ── stage 1: schema ──────────────────────────────────────────────
 
 
-def test_missing_required_field(layer):
-    record = good_record()
+def fag_seed(fag):
+    return copy.deepcopy(fag.seeds[0])
+
+
+def test_fag_candidate_missing_label_is_sent_back(fag):
+    record = fag_seed(fag)
     del record["label"]
-    verdict = layer.check(record, CTX)
-    assert verdict.repairable
+    verdict = SchemaLayer.from_spec(fag).check(record, CTX)
+    assert verdict.outcome == "fail_repairable"
     assert codes(verdict) == ["schema_required"]
     assert "'label'" in verdict.errors[0].message
 
 
-def test_wrong_field_type(layer):
-    record = good_record()
+def test_fag_turn_given_as_string_is_a_schema_type_error(fag):
+    record = fag_seed(fag)
     record["messages"][1]["turn"] = "2"
-    verdict = layer.check(record, CTX)
+    verdict = SchemaLayer.from_spec(fag).check(record, CTX)
     assert codes(verdict) == ["schema_type"]
     assert verdict.errors[0].path == "messages[1].turn"
 
@@ -110,15 +111,16 @@ def test_spec_enum_field(fag):
 def test_all_schema_errors_reported_together(layer):
     record = good_record()
     del record["spans"]
-    record["messages"][0]["turn"] = 0
-    assert sorted(codes(layer.check(record, CTX))) == ["schema_minimum", "schema_required"]
+    record["messages"][0]["turn"] = "1"
+    assert sorted(codes(layer.check(record, CTX))) == ["schema_required", "schema_type"]
 
 
-def test_schema_errors_suppress_later_stages(layer):
-    record = good_record()
+def test_fag_schema_error_hides_turn_errors(fag):
+    record = fag_seed(fag)
     del record["label"]
-    record["messages"][0]["role"] = "assistant"  # would be a turn error
-    assert codes(layer.check(record, CTX)) == ["schema_required"]
+    record["messages"][0]["role"] = "assistant"  # would be turn errors
+    record["messages"][1]["role"] = "customer"
+    assert codes(SchemaLayer.from_spec(fag).check(record, CTX)) == ["schema_required"]
 
 
 def test_invalid_schema_rejected():
@@ -129,11 +131,13 @@ def test_invalid_schema_rejected():
 # ── stage 2: turn structure ──────────────────────────────────────
 
 
-def test_turns_not_numbered_from_one(layer):
-    record = good_record()
+def test_fag_turns_not_numbered_from_one(fag):
+    record = fag_seed(fag)
+    record["messages"] = record["messages"][:2]
+    record["spans"] = []
     record["messages"][0]["turn"] = 2
     record["messages"][1]["turn"] = 3
-    verdict = layer.check(record, CTX)
+    verdict = SchemaLayer.from_spec(fag).check(record, CTX)
     assert codes(verdict) == ["turn_numbering", "turn_numbering"]
     assert verdict.errors[0].details == {"expected": 1, "got": 2}
 
@@ -183,16 +187,28 @@ def test_non_alternating_only_checks_first_role():
     assert codes(layer.check(record, CTX)) == ["first_role"]
 
 
-def test_numbered_from_zero():
-    structure = TurnStructure(
-        roles=["customer", "assistant"], first_role="customer", numbered_from=0
-    )
-    layer = SchemaLayer({"type": "object"}, structure)
-    record = good_record()
-    assert codes(layer.check(record, CTX)) == ["turn_numbering", "turn_numbering"]
-    for i, msg in enumerate(record["messages"]):
-        msg["turn"] = i
-    assert layer.check(record, CTX).passed
+def fag_spec_numbered_from_zero(tmp_path):
+    task_dir = tmp_path / "fag"
+    shutil.copytree(FAG_DIR, task_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    task_yaml = task_dir / "task.yaml"
+    text = task_yaml.read_text()
+    assert "numbered_from: 1" in text
+    task_yaml.write_text(text.replace("numbered_from: 1", "numbered_from: 0"))
+    return compile_spec(task_dir)
+
+
+def test_classification_spans_record_numbered_from_zero_passes(tmp_path):
+    compiled = fag_spec_numbered_from_zero(tmp_path)
+    record = copy.deepcopy(compiled.seeds[0])
+    record["messages"] = [
+        {"turn": 0, "role": "customer", "content": "Which business account should I be on?"},
+        {"turn": 1, "role": "assistant", "content": "Given your cash flow, take the Flex account."},
+    ]
+    record["spans"] = [
+        {"turn": 0, "text": "Which business account", "category": "NEED_BASED_FRAMING"}
+    ]
+    verdict = SchemaLayer.from_spec(compiled).check(record, CTX)
+    assert verdict.passed, verdict.messages()
 
 
 def test_no_turn_structure_skips_role_checks():
@@ -205,10 +221,11 @@ def test_no_turn_structure_skips_role_checks():
 # ── stage 3: task-type validators ────────────────────────────────
 
 
-def test_span_citing_missing_turn(layer):
-    record = good_record()
-    record["spans"] = [{"turn": 9, "text": "annual fee", "category": "X"}]
-    verdict = layer.check(record, CTX)
+def test_fag_span_citing_missing_turn_is_sent_back(fag):
+    record = fag_seed(fag)
+    record["messages"] = record["messages"][:2]
+    record["spans"] = [{"turn": 9, "text": "monthly fee", "category": "NEED_BASED_FRAMING"}]
+    verdict = SchemaLayer.from_spec(fag).check(record, CTX)
     assert codes(verdict) == ["span_turn"]
     assert verdict.repairable
     assert "turn=9" in verdict.errors[0].message
@@ -222,13 +239,6 @@ def test_task_type_validators_run_after_turns(layer):
     assert "span_turn" not in codes(layer.check(record, CTX))
 
 
-def test_validator_code():
-    def custom_errors(record):
-        return []
-
-    assert validator_code(custom_errors) == "custom"
-
-
 def test_custom_validator_errors_are_issues():
     layer = SchemaLayer({"type": "object"}, validators=[lambda r: ["bad thing"]])
     verdict = layer.check({}, CTX)
@@ -238,10 +248,16 @@ def test_custom_validator_errors_are_issues():
 # ── with the FAG spec ────────────────────────────────────────────
 
 
-def test_fag_seeds_pass(fag):
-    layer = SchemaLayer.from_spec(fag)
-    for seed in fag.seeds:
-        verdict = layer.check(dict(seed), CTX)
+@pytest.mark.parametrize("task", ["fag", "cfa", "groundness"])
+def test_every_seed_passes_l1(task):
+    task_dir = SDGF_DIR / "tasks" / task
+    if not (task_dir / "task.yaml").exists():
+        pytest.skip(f"tasks/{task} not present")
+    compiled = compile_spec(task_dir)
+    layer = SchemaLayer.from_spec(compiled)
+    assert compiled.seeds
+    for seed in compiled.seeds:
+        verdict = layer.check(copy.deepcopy(seed), CTX)
         assert verdict.passed, verdict.messages()
 
 
@@ -252,3 +268,16 @@ def test_fag_wrong_turn_order_fails_in_cascade(fag):
     result = cascade.run(record)
     assert result.failed_layer == "L1" and result.repairable
     assert "turn_numbering" in {e.code for e in result.errors}
+
+
+# ── with the CFA spec (sft_qa) ───────────────────────────────────
+
+
+def test_cfa_answer_that_disagrees_with_the_response_is_sent_back():
+    cfa = compile_spec(CFA_DIR)
+    record = copy.deepcopy(cfa.seeds[0])
+    assert record["response"].endswith("Answer: B")
+    record["answer"] = "C"
+    verdict = SchemaLayer.from_spec(cfa).check(record, CTX)
+    assert verdict.outcome == "fail_repairable"
+    assert codes(verdict) == ["response_answer"]

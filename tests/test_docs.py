@@ -64,3 +64,12 @@ def test_the_new_use_case_template_loads_the_new_keys():
     assert validation.consistency.temperatures == ConsistencyRules().temperatures
     RubricSection(**data["rubric"])
     assert "# judge_context:" in block and "# examples:" in block
+
+
+L1 = between(HOW, "### L1 ", "### L2 ")
+
+
+def test_l1_section_names_the_cfa_issue_codes_l1_reports():
+    # sft_qa's task-type checks report "response_answer" and "option", not the
+    # validator function names.
+    assert "`response_answer`, `option`" in L1

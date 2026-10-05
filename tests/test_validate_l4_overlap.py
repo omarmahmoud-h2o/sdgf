@@ -3,6 +3,7 @@ check, all hard drops. Every text here is a synthetic string written for the tes
 held-out files are temporary files built in tmp_path."""
 
 import copy
+import dataclasses
 import json
 from pathlib import Path
 
@@ -125,10 +126,20 @@ def test_lightly_edited_seed_is_caught():
     assert layer().check(rec(edited), CTX).codes == ("seed_overlap",)
 
 
-def test_threshold_is_exclusive_and_configurable():
-    score = jaccard(shingles(SEED_A), shingles(SEED_A + " Cheers."))
-    assert layer(threshold=score).check(rec(SEED_A + " Cheers."), CTX).passed
-    assert layer(threshold=score - 0.01).check(rec(SEED_A + " Cheers."), CTX).hard
+def test_copy_check_threshold_is_exclusive_on_a_worked_jaccard_example():
+    # Worked by hand with 3-character shingles: 'abcd' -> {abc, bcd}, 'abce' -> {abc, bce}.
+    # They share 1 shingle out of 3 distinct ones, so the Jaccard score is exactly 1/3.
+    at_score = layer(threshold=1 / 3, seeds=("abcd",), k=3).check(rec("abce"), CTX)
+    assert at_score.passed
+    below = layer(threshold=0.33, seeds=("abcd",), k=3).check(rec("abce"), CTX)
+    assert below.hard and below.codes == ("seed_overlap",)
+    assert below.errors[0].details["score"] == 0.3333
+
+
+def test_copy_check_ignores_case_and_punctuation():
+    v = layer(seeds=("Hello, WORLD!",)).check(rec("hello world"), CTX)
+    assert v.codes == ("seed_overlap",)
+    assert v.errors[0].details["score"] == 1.0
 
 
 def test_issue_never_repeats_matched_text():
@@ -188,12 +199,6 @@ def test_distinct_records_accumulate_without_false_positives():
 # ── held-out ─────────────────────────────────────────────────────
 
 
-def test_held_out_off_by_default():
-    l4 = layer()
-    assert not l4.held_out_enabled
-    assert l4.check(rec(OTHER), CTX).passed
-
-
 def test_held_out_match_is_reported(tmp_path):
     path = tmp_path / "eval.jsonl"
     path.write_text(json.dumps(rec("Hello", OTHER)) + "\n\n" + json.dumps(rec(SEED_B)) + "\n")
@@ -238,12 +243,17 @@ def test_held_out_load_errors(tmp_path):
         load_held_out([csv_path], columns=["text"])
 
 
-def test_layer_keeps_no_held_out_text(tmp_path):
+def test_copy_check_reports_no_held_out_text(tmp_path):
+    held_out_text = "Zebracorn invoices settle on the forty-second day in Quokkaville."
     path = tmp_path / "eval.jsonl"
-    path.write_text(json.dumps(rec(OTHER)) + "\n")
+    path.write_text(json.dumps(rec(held_out_text)) + "\n")
     l4 = layer(seeds=(), held_out=load_held_out([path]))
-    state = repr(vars(l4)) + repr([vars(i) for idx in l4._indexes for i in idx.values()])
-    assert OTHER not in state
+    near_copy = rec("Hi", held_out_text + " Thanks!")
+    v = l4.check(near_copy, CTX)
+    assert v.codes == ("held_out_overlap",)
+    reported = json.dumps([e.to_dict() for e in v.errors]) + repr(l4.scores(near_copy))
+    for word in ("Zebracorn", "zebracorn", "Quokkaville", "quokkaville", "invoices"):
+        assert word not in reported
 
 
 # ── engines ──────────────────────────────────────────────────────
@@ -324,24 +334,32 @@ def fag():
     return compile_spec(FAG_DIR)
 
 
-def test_from_spec_uses_seeds_and_overlap_max(fag):
+def test_fag_seed_sent_back_as_a_candidate_is_dropped_by_the_copy_check(fag):
     l4 = OverlapLayer.from_spec(fag)
-    assert not l4.held_out_enabled
     for seed in fag.seeds:
-        v = l4.check(seed, CTX)
-        assert v.codes == ("seed_overlap",)
-        assert v.errors[0].details["threshold"] == fag.spec.thresholds.overlap_max
+        v = l4.check(copy.deepcopy(seed), CTX)
+        assert v.hard and v.codes == ("seed_overlap",)
+        d = v.errors[0].details
+        # tasks/fag/task.yaml sets thresholds.overlap_max: 0.80.
+        assert (d["source"], d["score"], d["threshold"]) == ("seed", 1.0, 0.8)
 
 
 def test_fag_seeds_are_not_near_duplicates_of_each_other(fag):
-    l4 = OverlapLayer.from_spec(fag)
-    assert l4.scores(fag.seeds[0])[("shingle", "seed")].score == 1.0
     for i, seed in enumerate(fag.seeds):
-        rest = OverlapLayer(
-            l4.engines,
-            seeds=[(f"seed:{j}", record_text(s)) for j, s in enumerate(fag.seeds) if j != i],
-        )
-        assert rest.check(seed, CTX).passed
+        others = dataclasses.replace(fag, seeds=fag.seeds[:i] + fag.seeds[i + 1 :])
+        assert OverlapLayer.from_spec(others).check(seed, CTX).passed
+
+
+def test_copy_check_against_held_out_runs_only_when_a_path_is_given(fag, tmp_path):
+    candidate = rec("Hello", OTHER)
+    path = tmp_path / "eval.jsonl"
+    path.write_text(json.dumps(rec("Hello", OTHER)) + "\n")
+    assert OverlapLayer.from_spec(fag).check(candidate, CTX).passed
+    v = OverlapLayer.from_spec(fag, held_out_paths=[path]).check(candidate, CTX)
+    assert v.hard and v.codes == ("held_out_overlap",)
+    assert v.errors[0].details["source"] == "held_out"
+    dumped = json.dumps([e.to_dict() for e in v.errors])
+    assert "Testville" not in dumped and "weekdays" not in dumped
 
 
 def test_from_spec_held_out_and_embedding(fag, tmp_path):

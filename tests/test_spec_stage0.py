@@ -207,3 +207,18 @@ def test_example_may_not_show_the_label_or_spans(tmp_path):
     (problem,) = problems_of(tmp_path)
     assert problem.startswith("rubric.examples[1]: record has fields the judge may not see")
     assert "['label', 'spans']" in problem and "allowed: ['messages']" in problem
+
+
+TURNS_YAML = """\
+output_schema:
+  turns:
+    roles: [customer, assistant]
+    first_role: customer
+"""
+
+
+def test_classification_spans_spec_without_turns_is_rejected(tmp_path):
+    yaml_text = TASK_YAML.replace(TURNS_YAML, "output_schema: {}\n")
+    (problem,) = problems_of(write_task(tmp_path, yaml_text=yaml_text))
+    assert problem.startswith("output_schema.turns:")
+    assert "classification_spans" in problem

@@ -85,7 +85,7 @@ previous one passed, because a broken record makes later steps report noise:
 | | FAG | CFA |
 |---|---|---|
 | Fails when | The model returns the conversation but leaves out `severity`, `signal_categories` and four other required fields. | The `answer` field says C but the response ends `Answer: B`, or the question lists only one option. |
-| Issue codes | `schema_required`, `turn_numbering`, `role_alternation`, `first_role` | `response_answer_errors`, `option_errors` |
+| Issue codes | `schema_required`, `turn_numbering`, `role_alternation`, `first_role` | `response_answer`, `option` |
 | Result | sent back | sent back |
 
 ### L2 Rules

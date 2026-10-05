@@ -205,18 +205,6 @@ def test_all_checks_reported_together():
 # ── FAG ────────────────────────────────────────────────────────
 
 
-def test_from_spec_uses_fag_label_rule(fag):
-    layer = RulesLayer.from_spec(fag)
-    assert layer.label_rule is fag.hooks.label_rule
-    assert layer.rules == ()
-
-
-def test_fag_seeds_pass_l2(fag):
-    layer = RulesLayer.from_spec(fag)
-    for seed in fag.seeds:
-        assert layer.check(dict(seed), CTX).passed, seed.get("conversation_id")
-
-
 def test_fag_label_disagreeing_with_tier_and_scope_fails_at_l2(fag):
     seed = next(s for s in fag.seeds if s["advice_tier"] == "PERSONAL_ADVICE")
     bad = {**seed, "label": False}

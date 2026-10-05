@@ -3,23 +3,22 @@ traces get stricter handling. All identifiers and secrets are fictional placehol
 
 import copy
 import json
+import textwrap
 from pathlib import Path
 
 import pytest
 
-from sdgf.governance.profile import GovernanceProfile, merge_profile
 from sdgf.spec.compile import compile_spec
-from sdgf.spec.schema import GovernanceSection
 from sdgf.store.provenance import ToolTraceEntry
 from sdgf.validate.base import Layer, ValidationContext
 from sdgf.validate.cascade import Cascade
 from sdgf.validate.l1_schema import SchemaLayer
 from sdgf.validate.l2_rules import RulesLayer
-from sdgf.validate.l3_governance import GovernanceLayer, is_sensitive, sensitive_entries
+from sdgf.validate.l3_governance import GovernanceLayer, sensitive_entries
 
 FAG_DIR = Path(__file__).resolve().parents[1] / "tasks" / "fag"
 CTX = ValidationContext()
-L3 = GovernanceLayer.from_profile()
+L3 = GovernanceLayer.from_spec(compile_spec(FAG_DIR / "task.yaml"))
 
 
 def record(assistant="The monthly fee is $10 and there is no setup cost.", **extra):
@@ -48,9 +47,80 @@ def fag():
     return compile_spec(FAG_DIR / "task.yaml")
 
 
-def test_clean_record_passes():
-    verdict = L3.check(record(), CTX)
+TASK_YAML = """\
+task:
+  name: governed-toy
+  version: "0.1"
+  type: classification_spans
+  generation_mode: label_first
+  description: Toy task whose governance section tightens or documents exceptions.
+output_schema:
+  turns:
+    roles: [customer, assistant]
+    first_role: customer
+rubric:
+  verdict:
+    values: [pass, fail]
+seeds:
+  path: seeds.jsonl
+coverage:
+  target_size: 10
+  axes:
+    - name: label
+      values: [true, false]
+models:
+  generator:
+    backend: mock
+    model: mock-1
+validation:
+  layers: [L1, L2, L3]
+thresholds:
+  fidelity_min: 0.95
+  kappa_min: 0.8
+  coverage_min_cell_fill: 0.9
+  balance_tolerance: 0.05
+  distinct_n_min: 0.3
+  self_bleu_max: 0.6
+  semantic_diversity_min: 1.0
+  residual_error_max: 0.05
+  overlap_max: 0.8
+  cost_per_record_max: 0.05
+"""
+
+
+def governed(tmp_path, governance=""):
+    """The safety scan of a task whose task.yaml carries `governance` (YAML text)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "task.yaml").write_text(TASK_YAML + textwrap.dedent(governance), encoding="utf-8")
+    (tmp_path / "seeds.jsonl").write_text(json.dumps(record()) + "\n", encoding="utf-8")
+    return GovernanceLayer.from_spec(compile_spec(tmp_path))
+
+
+def test_task_pii_pattern_from_task_yaml_is_dropped(tmp_path):
+    layer = governed(
+        tmp_path,
+        """\
+        governance:
+          extra_pii_patterns:
+            member_no: 'MBR-\\d{6}'
+        """,
+    )
+    verdict = layer.check(record("Thanks, member MBR-000000, your fee is waived."), CTX)
+    assert verdict.hard and verdict.codes == ("pii_member_no",)
+
+
+def test_clean_fag_seed_passes_the_safety_scan(fag):
+    verdict = GovernanceLayer.from_spec(fag).check(seeds()[0], CTX)
     assert verdict.passed and verdict.layer == "L3"
+
+
+def test_tfn_in_a_turn_is_dropped_with_its_offsets(fag):
+    verdict = GovernanceLayer.from_spec(fag).check(record("Your TFN on file is 000 000 000."), CTX)
+    assert verdict.hard and not verdict.repairable
+    assert verdict.codes == ("pii_tfn",)
+    issue = verdict.errors[0]
+    assert issue.path == "messages[1].content"
+    assert (issue.details["start"], issue.details["end"]) == (20, 31)
 
 
 @pytest.mark.parametrize(
@@ -71,19 +141,10 @@ def test_each_scanner_is_a_hard_fail(text, code):
     assert issue.path == "messages[1].content"
 
 
-def test_denied_entity_is_a_hard_fail():
-    profile = merge_profile(GovernanceSection(entity_deny=["Fictional Megabank"]))
-    layer = GovernanceLayer.from_profile(profile)
-    verdict = layer.check(record("Fictional Megabank offers a cheaper account."), CTX)
-    assert verdict.hard and verdict.codes == ("entity_denied",)
-    assert verdict.errors[0].details["rule"] == "Fictional Megabank"
-
-
 def test_issues_never_repeat_the_matched_text():
     verdict = L3.check(record("Your TFN on file is 000 000 000."), CTX)
-    for issue in verdict.errors:
-        dumped = json.dumps(issue.to_dict())
-        assert "000 000 000" not in dumped and "000000000" not in dumped
+    dumped = json.dumps([issue.to_dict() for issue in verdict.errors])
+    assert "000 000 000" not in dumped and "000000000" not in dumped
 
 
 def test_every_finding_is_reported_across_scanners_and_fields():
@@ -113,19 +174,18 @@ def test_needs_a_scanner():
 # ── sensitive tool traces ────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "label, sensitive",
-    [
-        (None, False),
-        ("", False),
-        ("public", False),
-        ("internal", True),
-        ("restricted", True),
-        ("made-up-level", True),
-    ],
-)
-def test_sensitivity_labels(label, sensitive):
-    assert is_sensitive(label) is sensitive
+@pytest.mark.parametrize("label", ["made-up-level", "internal", "restricted"])
+def test_unknown_or_sensitive_label_fails_closed_on_identifier_numbers(label):
+    entry = {"tool": "ledger", "result": {"status": "ok"}, "sensitivity": label}
+    verdict = L3.check(record("Ref 1234-5678"), traced(entry))
+    assert verdict.hard and verdict.codes == ("sensitive_identifier",)
+    assert verdict.errors[0].details == {"start": 4, "end": 13}
+
+
+@pytest.mark.parametrize("label", [None, "", "public"])
+def test_public_or_unlabelled_trace_leaves_identifier_numbers_alone(label):
+    entry = {"tool": "catalogue", "result": {"status": "ok"}, "sensitivity": label}
+    assert L3.check(record("Ref 1234-5678"), traced(entry)).passed
 
 
 def test_sensitive_entries_accept_dataclasses_and_dicts():
@@ -217,7 +277,23 @@ def test_fag_seed_with_tfn_passes_l1_l2_and_drops_at_l3(fag):
     assert [e.code for e in result.errors] == ["pii_tfn"]
 
 
-def test_code_built_profile_is_honoured():
-    profile = GovernanceProfile(entity_deny=frozenset({"Fictional Megabank"}))
-    layer = GovernanceLayer.from_profile(profile)
-    assert layer.check(record("Try fictional  megabank instead."), CTX).codes == ("entity_denied",)
+TOXICITY_EXCEPTION = """\
+governance:
+  toxicity_exceptions: [profanity]
+  exceptions:
+    - rule: toxicity:profanity
+      reason: a toxicity-detection task needs profane customer turns
+"""
+
+
+def test_documented_toxicity_exception_lets_profanity_through(tmp_path):
+    rec = record("This is bullshit")
+    assert governed(tmp_path / "plain").check(rec, CTX).codes == ("toxicity_profanity",)
+    assert governed(tmp_path / "excepted", TOXICITY_EXCEPTION).check(rec, CTX).passed
+
+
+def test_denied_entity_from_task_yaml_is_dropped_whatever_its_spelling(tmp_path):
+    layer = governed(tmp_path, "governance:\n  entity_deny: [Fictional Megabank]\n")
+    verdict = layer.check(record("If the fee bothers you, try fictional   MEGABANK."), CTX)
+    assert verdict.hard and verdict.codes == ("entity_denied",)
+    assert verdict.errors[0].details["rule"] == "Fictional Megabank"

@@ -7,7 +7,6 @@ treat each seed as a generated record -> attach provenance -> write, resume and 
 import random
 from pathlib import Path
 
-import jsonschema
 import pytest
 
 from sdgf.models.mock import MockBackend
@@ -15,8 +14,9 @@ from sdgf.models.registry import build_models
 from sdgf.spec.compile import compile_spec
 from sdgf.store.artefacts import ArtefactStore
 from sdgf.store.provenance import ProvenanceBuilder, attach, split
-from sdgf.tasktypes.classification_spans import turn_structure_errors
 from sdgf.tasktypes.registry import REGISTRY
+from sdgf.validate.base import ValidationContext
+from sdgf.validate.l1_schema import SchemaLayer
 
 FAG_DIR = Path(__file__).resolve().parents[1] / "tasks" / "fag"
 LAYERS = ("L1", "L2")
@@ -56,15 +56,14 @@ def test_seeds_flow_through_provenance_and_store(fag, tmp_path):
         fag.spec.models,
         overrides={"generator": MockBackend(["{}"]), "judge": MockBackend(["{}"])},
     )
-    schema = REGISTRY.resolve(fag.spec.task).output_schema(fag.spec.output_schema)
+    l1 = SchemaLayer.from_spec(fag)
     run = ArtefactStore(tmp_path).open_run(fag.spec_version, run_id="m1")
 
     written = []
     with run.jsonl("accepted") as out:
         for i, seed in enumerate(fag.seeds):
             record = fag.hooks.post_process(seed)
-            jsonschema.validate(record, schema)
-            assert turn_structure_errors(record, fag.spec.output_schema.turns) == []
+            assert l1.check(record, ValidationContext()).passed
             b = ProvenanceBuilder(
                 fag.spec_version, f"cell-{i:04d}", seed=i, models=models.endpoints(), run_id="m1"
             )

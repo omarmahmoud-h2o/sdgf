@@ -162,6 +162,19 @@ def tool_gate_problems(spec: TaskSpec, tool_registry: Container[str]) -> list[st
     ]
 
 
+TURN_TASK_TYPES = frozenset({"classification_spans"})
+
+
+def turns_gate_problems(spec: TaskSpec) -> list[str]:
+    """A conversation task type declares its turn structure; L1 checks turns against it."""
+    if spec.task.type not in TURN_TASK_TYPES or spec.output_schema.turns is not None:
+        return []
+    return [
+        f"output_schema.turns: {spec.task.type} records are conversations, so the spec must "
+        "declare roles and first_role (numbered_from defaults to 1)"
+    ]
+
+
 def threshold_gate_problems(spec: TaskSpec) -> list[str]:
     """Every release threshold must be set (§6.1 step 5)."""
     return [f"thresholds.{name}: release threshold is not set" for name in spec.thresholds.unset()]
@@ -241,6 +254,7 @@ def stage0_problems(
         ),
         *example_gate_problems(spec, pii_engines=pii_engines, toxicity_engines=toxicity_engines),
         *tool_gate_problems(spec, tool_registry),
+        *turns_gate_problems(spec),
         *threshold_gate_problems(spec),
         *consistency_gate_problems(spec),
         *decision_model_gate_problems(spec),

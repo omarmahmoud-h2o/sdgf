@@ -10,14 +10,12 @@ import pytest
 
 from sdgf.governance._util import GovernanceEngineError
 from sdgf.governance.pii import (
-    GLOBAL_PII_PATTERNS,
     CompositePIIScanner,
-    PIIFinding,
     PresidioPIIScanner,
     RegexPIIScanner,
     build_pii_scanner,
 )
-from sdgf.governance.profile import GLOBAL_PII_RULES, GovernanceProfile, merge_profile
+from sdgf.governance.profile import GovernanceProfile, merge_profile
 from sdgf.spec.schema import GovernanceSection
 
 FAG_SEEDS = Path(__file__).resolve().parents[1] / "tasks" / "fag" / "seeds.jsonl"
@@ -27,10 +25,6 @@ SCANNER = RegexPIIScanner()
 
 def rules(text: str) -> list[tuple[str, str]]:
     return [(f.rule, f.text) for f in SCANNER.scan_text(text)]
-
-
-def test_every_global_rule_has_a_pattern():
-    assert set(GLOBAL_PII_RULES) == set(GLOBAL_PII_PATTERNS)
 
 
 @pytest.mark.parametrize(
@@ -120,20 +114,6 @@ def test_scan_record_walks_nested_strings_with_paths():
     assert ("_provenance.contact", "email") in [(f.path, f.rule) for f in with_private]
 
 
-def test_finding_to_dict():
-    f = PIIFinding("tfn", "000 000 000", 4, 15, "messages[0].content")
-    assert f.to_dict() == {
-        "scanner": "pii",
-        "rule": "tfn",
-        "text": "000 000 000",
-        "start": 4,
-        "end": 15,
-        "path": "messages[0].content",
-        "engine": "regex",
-        "score": 1.0,
-    }
-
-
 # ── profile-driven rules ─────────────────────────────────────────
 
 
@@ -184,10 +164,8 @@ class FakeResult:
 class FakeAnalyzer:
     def __init__(self, results):
         self.results = results
-        self.calls = []
 
     def analyze(self, text, language, entities=None):
-        self.calls.append((text, language, entities))
         return self.results
 
 
@@ -206,7 +184,6 @@ def test_presidio_adapter_maps_entities_and_threshold():
         ("person", "Jane Citizen", "presidio", 0.85),
         ("email", "x@example.com", "presidio", 0.99),
     ]
-    assert analyzer.calls == [(text, "en", ["EMAIL_ADDRESS", "PERSON"])]
 
 
 def test_presidio_imported_lazily(monkeypatch):

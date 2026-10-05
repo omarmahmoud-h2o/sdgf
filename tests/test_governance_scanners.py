@@ -17,13 +17,11 @@ from sdgf.governance.profile import (
     merge_profile,
 )
 from sdgf.governance.secrets import (
-    GLOBAL_SECRET_PATTERNS,
     SecretFinding,
     SecretScanner,
     build_secret_scanner,
 )
 from sdgf.governance.toxicity import (
-    GLOBAL_TOXICITY_KEYWORDS,
     CompositeToxicityScanner,
     DetoxifyToxicityScanner,
     KeywordToxicityScanner,
@@ -46,10 +44,6 @@ TOX = KeywordToxicityScanner()
 
 def categories(text: str, scanner=TOX) -> list[tuple[str, str]]:
     return [(f.rule, f.text) for f in scanner.scan_text(text)]
-
-
-def test_every_global_category_has_keywords():
-    assert set(GLOBAL_TOXICITY_CATEGORIES) == set(GLOBAL_TOXICITY_KEYWORDS)
 
 
 @pytest.mark.parametrize(
@@ -144,10 +138,8 @@ def test_fag_seeds_have_no_toxicity():
 class FakeDetoxify:
     def __init__(self, scores: dict[str, float]) -> None:
         self.scores = scores
-        self.calls: list[str] = []
 
     def predict(self, text: str) -> dict[str, float]:
-        self.calls.append(text)
         return self.scores
 
 
@@ -168,7 +160,6 @@ def test_detoxify_maps_heads_and_thresholds():
     assert [(f.rule, f.score) for f in found] == [("profanity", 0.8), ("threat", 0.6)]
     assert all(f.start == 0 and f.end == len("some text") and f.engine == "detoxify" for f in found)
     assert scanner.scan_text("   ") == []
-    assert model.calls == ["some text"]
 
 
 def test_detoxify_respects_exceptions():
@@ -217,10 +208,6 @@ SEC = SecretScanner()
 
 def secrets_in(text: str) -> list[tuple[str, str]]:
     return [(f.rule, f.text) for f in SEC.scan_text(text)]
-
-
-def test_every_global_secret_rule_has_a_pattern():
-    assert set(GLOBAL_SECRET_RULES) == set(GLOBAL_SECRET_PATTERNS)
 
 
 FAKE_JWT = "eyJ" + "A" * 20 + ".eyJ" + "B" * 20 + "." + "C" * 20

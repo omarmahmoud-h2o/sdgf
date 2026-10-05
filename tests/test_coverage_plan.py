@@ -54,7 +54,10 @@ task:
   type: classification_spans
   generation_mode: label_first
   description: Write exam questions about fictional small-business finance.
-output_schema: {{}}
+output_schema:
+  turns:
+    roles: [customer, assistant]
+    first_role: customer
 rubric:
   verdict:
     values: [pass, fail]

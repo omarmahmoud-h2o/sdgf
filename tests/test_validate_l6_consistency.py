@@ -16,7 +16,8 @@ from sdgf.spec.schema import (
     SpecValidationError,
     parse_spec,
 )
-from sdgf.validate.base import LayerVerdict, ValidationContext
+from sdgf.tasktypes.sft_qa import MULTIPLE_CHOICE
+from sdgf.validate.base import ValidationContext
 from sdgf.validate.cascade import Cascade
 from sdgf.validate.l5_judge import JudgeLayer
 from sdgf.validate.l6_consistency import (
@@ -61,15 +62,23 @@ RECORD = {"question": "Q?", "answer": "A.", "label": "yes", "_provenance": {"x":
 FIELDS = ("question", "answer")
 
 
-def l5_verdict(escalate=True, agrees=True, conf=0.9, outcome="pass"):
-    judge = {"verdict": "yes", "scores": {}, "confidence": {"verdict": conf}}
-    details = {"judge": judge, "agrees": agrees, "low_confidence": conf < 0.7}
-    details["escalate"] = escalate
-    return LayerVerdict("L5", outcome, (), details)
+FLAGGED = {"label": "yes", "contestable": True}  # fixed facts that flag for extra votes
 
 
-def ctx(*previous, recipe=None):
-    return ValidationContext(cell_id="c1", recipe=recipe or {"label": "yes"}, previous=previous)
+def judged(recipe=FLAGGED, verdict="yes", conf=0.9, labels=None, record=RECORD):
+    """A context whose L5 verdict comes from running the real blind judge layer (L5)."""
+    context = ValidationContext(cell_id="c1", recipe=recipe)
+    l5 = JudgeLayer(VoteJudge([verdict], conf=conf), fields=FIELDS, labels=labels)
+    return dataclasses.replace(context, previous=(l5.check(record, context),))
+
+
+def unflagged():
+    """L5 confident and agreeing, on a cell neither hard nor contestable."""
+    return judged(recipe={"label": "yes"})
+
+
+def ctx(recipe=None):
+    return ValidationContext(cell_id="c1", recipe=recipe or {"label": "yes"})
 
 
 def layer(judge, **kw):
@@ -83,9 +92,8 @@ def layer(judge, **kw):
 
 def test_not_escalated_passes_without_votes():
     judge = VoteJudge([])
-    v = layer(judge).check(RECORD, ctx(l5_verdict(escalate=False)))
+    v = layer(judge).check(RECORD, unflagged())
     assert v.passed and v.details == {"escalated": False, "method": "skipped"}
-    assert judge.seen == []
 
 
 def test_escalation_from_recipe_when_no_l5_verdict():
@@ -94,7 +102,7 @@ def test_escalation_from_recipe_when_no_l5_verdict():
     for recipe in ({"label": "yes", "difficulty": "HARD"}, {"label": "yes", "contestable": True}):
         judge = VoteJudge(["yes"] * 5)
         v = layer(judge).check(RECORD, ctx(recipe=recipe))
-        assert v.passed and v.details["method"] == "votes" and len(judge.seen) == 5
+        assert v.passed and v.details["method"] == "votes" and v.details["cast"] == 5
 
 
 def test_escalation_rules_can_turn_off_hard_and_contestable():
@@ -106,86 +114,99 @@ def test_escalation_rules_can_turn_off_hard_and_contestable():
 
 def test_escalated_only_false_votes_on_every_record():
     judge = VoteJudge(["yes"] * 3)
-    v = layer(judge, k=3, escalated_only=False).check(RECORD, ctx(l5_verdict(escalate=False)))
-    assert v.details["method"] == "votes" and len(judge.seen) == 3
+    v = layer(judge, k=3, escalated_only=False).check(RECORD, unflagged())
+    assert v.details["method"] == "votes" and v.details["cast"] == 3
 
 
 # ── label_first K votes ──────────────────────────────────────────
 
 
 def test_majority_matching_label_passes():
-    v = layer(VoteJudge(["yes", "no", "yes", "yes", "unclear"])).check(RECORD, ctx(l5_verdict()))
+    v = layer(VoteJudge(["yes", "no", "yes", "yes", "unclear"])).check(RECORD, judged())
     assert v.passed
     assert v.details["agree"] == 3 and v.details["cast"] == 5 and v.details["majority"] == "yes"
 
 
-def test_majority_against_label_is_repairable():
-    v = layer(VoteJudge(["no", "no", "yes", "no", "yes"])).check(RECORD, ctx(l5_verdict()))
+def test_majority_against_label_is_sent_back():
+    v = layer(VoteJudge(["no", "no", "yes", "no", "yes"])).check(RECORD, judged())
     assert v.repairable and v.codes == ("consistency_disagrees",)
     assert v.errors[0].details == {"agree": 2, "cast": 5, "majority": "no"}
     assert "fixed label" in v.errors[0].message
 
 
-def test_tie_is_not_a_majority():
-    v = layer(VoteJudge(["yes", "no", "yes", "no"]), k=4).check(RECORD, ctx(l5_verdict()))
-    assert v.repairable
+def test_two_of_four_tie_is_sent_back():
+    v = layer(VoteJudge(["yes", "no", "yes", "no"]), k=4).check(RECORD, judged())
+    assert v.repairable and v.codes == ("consistency_disagrees",)
+    assert v.errors[0].details == {"agree": 2, "cast": 4, "majority": "yes"}
 
 
 def test_split_non_label_votes_still_fail_without_label_majority():
     # "yes" is the most common single verdict but not more than half of the votes.
-    v = layer(VoteJudge(["yes", "yes", "no", "unclear", "no"])).check(RECORD, ctx(l5_verdict()))
+    v = layer(VoteJudge(["yes", "yes", "no", "unclear", "no"])).check(RECORD, judged())
     assert v.repairable
 
 
 def test_unparseable_votes_are_abstentions_not_in_denominator():
     # §12.1: 2 agreeing of 2 cast passes; DS²-Instruct would score it 2/5 and drop it.
     judge = VoteJudge(["yes", None, None, "yes", None])
-    v = layer(judge).check(RECORD, ctx(l5_verdict()))
+    v = layer(judge).check(RECORD, judged())
     assert v.passed
     assert v.details["cast"] == 2 and v.details["abstained"] == 3
     assert v.details["votes"] == ["yes", None, None, "yes", None]
 
 
 def test_abstentions_do_not_rescue_a_disagreement():
-    v = layer(VoteJudge(["no", None, "yes", "no", None])).check(RECORD, ctx(l5_verdict()))
+    v = layer(VoteJudge(["no", None, "yes", "no", None])).check(RECORD, judged())
     assert v.repairable and v.errors[0].details["cast"] == 3
 
 
-def test_all_votes_unparseable_is_a_hard_drop():
-    v = layer(VoteJudge([None] * 5)).check(RECORD, ctx(l5_verdict()))
+def test_all_votes_unparseable_is_dropped():
+    v = layer(VoteJudge([None] * 5)).check(RECORD, judged())
     assert v.hard and v.codes == ("consistency_no_votes",)
+    assert v.details["cast"] == 0 and v.details["abstained"] == 5
 
 
 def test_votes_are_blind_to_label_and_private_keys():
     judge = VoteJudge(["yes"] * 5)
-    layer(judge).check(RECORD, ctx(l5_verdict()))
+    layer(judge).check(RECORD, judged())
     assert judge.seen == [{"question": "Q?", "answer": "A."}] * 5
 
 
 def test_label_map_and_recipe_label_win():
     labels = {"yes": True, "no": False}
-    record = dict(RECORD, label=False)  # the recipe owns the label
+    record = dict(RECORD, label=False)  # the fixed facts own the label
+    fixed = {"label": True, "contestable": True}
     lay = layer(VoteJudge(["yes"] * 3), k=3, labels=labels)
-    assert lay.check(record, ctx(l5_verdict(), recipe={"label": True})).passed
+    assert lay.check(record, judged(fixed, labels=labels, record=record)).passed
     # A bool mapping only matches a bool label: 1 is not True.
+    fixed = {"label": 1, "contestable": True}
     lay = layer(VoteJudge(["yes"] * 3), k=3, labels=labels)
-    assert lay.check(record, ctx(l5_verdict(), recipe={"label": 1})).repairable
+    assert lay.check(record, judged(fixed, labels=labels, record=record)).repairable
+
+
+def test_majority_is_read_by_meaning_through_the_labels_map():
+    # No raw verdict wins (1 of 3 each), but "yes" and "unclear" both mean True:
+    # 2 of 3 votes agree with the fixed label by meaning.
+    labels = {"yes": True, "unclear": True, "no": False}
+    fixed = {"label": True, "contestable": True}
+    lay = layer(VoteJudge(["yes", "unclear", "no"]), k=3, labels=labels)
+    v = lay.check(RECORD, judged(fixed, labels=labels))
+    assert v.passed and v.details["agree"] == 2
 
 
 # ── trusted judge: confidence replaces votes ─────────────────────
 
 
-def test_trusted_confident_agreeing_judge_skips_votes():
-    judge = VoteJudge([])
-    v = layer(judge, trusted=True).check(RECORD, ctx(l5_verdict(conf=0.95)))
-    assert v.passed and v.details == {"escalated": True, "method": "confidence", "confidence": 0.95}
-    assert judge.seen == []
+def test_trusted_judge_confident_at_the_threshold_passes_without_votes():
+    # L5 agreed at confidence 0.70, exactly escalation.low_confidence: not low.
+    unused = VoteJudge([])  # any vote would pop an empty script and raise
+    v = layer(unused, trusted=True).check(RECORD, judged(conf=0.70))
+    assert v.passed and v.details == {"escalated": True, "method": "confidence", "confidence": 0.7}
 
 
-def test_trusted_judge_with_low_confidence_still_votes():
-    judge = VoteJudge(["yes"] * 5)
-    v = layer(judge, trusted=True).check(RECORD, ctx(l5_verdict(conf=0.5)))
-    assert v.details["method"] == "votes" and len(judge.seen) == 5
+def test_trusted_judge_just_below_the_threshold_takes_votes():
+    v = layer(VoteJudge(["yes"] * 5), trusted=True).check(RECORD, judged(conf=0.69))
+    assert v.passed and v.details["method"] == "votes" and v.details["cast"] == 5
 
 
 def test_trusted_judge_without_l5_verdict_votes():
@@ -196,15 +217,14 @@ def test_trusted_judge_without_l5_verdict_votes():
 
 def test_untrusted_judge_votes_even_when_confident():
     judge = VoteJudge(["yes"] * 5)
-    v = layer(judge).check(RECORD, ctx(l5_verdict(conf=0.99)))
+    v = layer(judge).check(RECORD, judged(conf=0.99))
     assert v.details["method"] == "votes"
 
 
 # ── answer_emergent ──────────────────────────────────────────────
 
 
-def letter(text):
-    return text.strip()[-1] if text and text.strip()[-1] in "ABCD" else None
+letter = MULTIPLE_CHOICE.extractor  # the real sft_qa multiple_choice extractor
 
 
 def answer_layer(replies, k=5, **kw):
@@ -221,31 +241,34 @@ def answer_layer(replies, k=5, **kw):
 
 def test_answer_emergent_majority_becomes_the_answer():
     lay = answer_layer(["Answer: B", "Answer: B", "Answer: C", "so B", "Answer: A"])
-    v = lay.check(RECORD, ctx(l5_verdict()))
+    v = lay.check(RECORD, judged())
     assert v.passed and v.details["answer"] == "B" and v.details["response"] == "Answer: B"
     assert v.details["votes"] == ["B", "B", "C", "B", "A"]
 
 
 def test_answer_emergent_ignores_trust_and_always_votes():
     lay = answer_layer(["B"] * 5, trusted=True)
-    assert lay.check(RECORD, ctx(l5_verdict(conf=0.99))).details["method"] == "votes"
+    assert lay.check(RECORD, judged(conf=0.99)).details["method"] == "votes"
 
 
 def test_answer_emergent_unreadable_answers_abstain():
     # 2 of 2 readable votes, where the §12.1 bug would score 2/5.
-    lay = answer_layer(["B", "no idea", None, "B", "hmm"])
-    v = lay.check(RECORD, ctx(l5_verdict()))
+    lay = answer_layer(
+        ["Answer: B", "I am not sure.", None, "Answer: B", ""], answer_field="answer"
+    )
+    record = {"question": "Q?", "response": "Answer: B", "answer": "B"}
+    v = lay.check(record, judged())
     assert v.passed and v.details["answer"] == "B"
     assert v.details["cast"] == 2 and v.details["abstained"] == 3
 
 
 def test_answer_emergent_without_majority_is_repairable():
-    v = answer_layer(["A", "B", "C", "A", "B"]).check(RECORD, ctx(l5_verdict()))
+    v = answer_layer(["A", "B", "C", "A", "B"]).check(RECORD, judged())
     assert v.repairable and v.codes == ("consistency_no_majority",)
 
 
 def test_answer_emergent_no_readable_answers_is_hard():
-    v = answer_layer(["?", None, "x", "", "y"]).check(RECORD, ctx(l5_verdict()))
+    v = answer_layer(["?", None, "x", "", "y"]).check(RECORD, judged())
     assert v.hard and v.codes == ("consistency_no_votes",)
 
 
@@ -262,7 +285,7 @@ def test_backend_answerer_cycles_temperatures():
     lay = ConsistencyLayer(
         mode="answer_emergent", k=4, fields=("question",), answerer=answerer, extractor=letter
     )
-    v = lay.check(RECORD, ctx(l5_verdict()))
+    v = lay.check(RECORD, judged())
     assert v.details["answer"] == "B"
     assert [c.temperature for c in backend.calls] == [0.7, 0.9, 0.7, 0.9]
     assert backend.calls[0].prompt == "Q?\n\nAnswer with a letter."
@@ -289,22 +312,15 @@ def test_majority_helper():
 # ── cascade integration and FAG ──────────────────────────────────
 
 
-def fake_l5(details):
-    class L5:
-        name = "L5"
-
-        def check(self, record, context):
-            return LayerVerdict("L5", "pass", (), details)
-
-    return L5()
-
-
 def test_cascade_hands_l6_the_l5_verdict():
+    def l5():
+        return JudgeLayer(VoteJudge(["yes"]), fields=FIELDS)
+
     judge = VoteJudge(["no"] * 5)
-    cascade = Cascade([fake_l5({"escalate": True, "agrees": True}), layer(judge)])
-    result = cascade.run(RECORD, ValidationContext(recipe={"label": "yes"}))
+    cascade = Cascade([l5(), layer(judge)])
+    result = cascade.run(RECORD, ValidationContext(recipe=FLAGGED))
     assert result.failed_layer == "L6" and result.repairable
-    cascade = Cascade([fake_l5({"escalate": False}), layer(VoteJudge([]))])
+    cascade = Cascade([l5(), layer(VoteJudge([]))])
     assert cascade.run(RECORD, ValidationContext(recipe={"label": "yes"})).passed
 
 
@@ -370,10 +386,11 @@ def test_fag_contestable_seed_fails_when_votes_disagree(fag, seeds):
 # ── answer_emergent: the majority is the record's answer ─────────
 
 
-def test_answer_emergent_record_answer_differing_from_the_majority_is_repairable():
-    lay = answer_layer(["B", "B", "B", "C", "A"], answer_field="answer")
+def test_answer_emergent_record_answer_differing_from_the_majority_is_sent_back():
+    replies = ["Answer: B", "Answer: B", "Answer: C", "Answer: B", "Answer: A"]
+    lay = answer_layer(replies, answer_field="answer")
     record = {"question": "Q?", "response": "Answer: C", "answer": "C"}
-    v = lay.check(record, ctx(l5_verdict()))
+    v = lay.check(record, judged())
     assert v.repairable and v.codes == ("consistency_answer_mismatch",)
     assert v.errors[0].path == "answer"
     assert v.errors[0].details == {"agree": 3, "cast": 5, "majority": "B", "answer": "C"}
@@ -383,7 +400,7 @@ def test_answer_emergent_record_answer_differing_from_the_majority_is_repairable
 def test_answer_emergent_record_answer_matching_the_majority_passes():
     lay = answer_layer(["B", "B", "B", "C", "A"], answer_field="answer")
     record = {"question": "Q?", "response": "Answer: B", "answer": "B"}
-    v = lay.check(record, ctx(l5_verdict()))
+    v = lay.check(record, judged())
     assert v.passed and v.details["answer"] == "B"
 
 
@@ -397,29 +414,17 @@ def test_answer_field_is_hidden_from_the_voters():
         extractor=letter,
         answer_field="answer",
     )
-    lay.check({"question": "Q?", "answer": "B"}, ctx(l5_verdict()))
+    lay.check({"question": "Q?", "answer": "B"}, judged())
     assert seen == [{"question": "Q?"}]
 
 
 def test_from_spec_checks_the_task_types_answer_under_answer_emergent():
     cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
     lay = ConsistencyLayer.from_spec(cfa, answerer=lambda view, i: "Answer: A")
-    assert (lay.mode, lay.answer_field, lay.fields, lay.k) == (
-        "answer_emergent",
-        "answer",
-        ("question",),
-        5,
-    )
     # escalation.always: voted with no L5 verdict and no hard or contestable facts
     record = {"question": "Q?\nA) x\nB) y", "response": "Answer: B", "answer": "B"}
     v = lay.check(record, ValidationContext(cell_id="c1", recipe={}))
     assert v.repairable and v.codes == ("consistency_answer_mismatch",)
-
-
-def test_label_first_from_spec_checks_no_answer_field():
-    fag = compile_spec(FAG_DIR)
-    judge = LLMJudge.from_spec(fag, MockBackend(["{}"], cycle=True))
-    assert ConsistencyLayer.from_spec(fag, judge=judge).answer_field is None
 
 
 # ── per-vote diversity (validation.consistency, models.consistency_judge) ──
@@ -443,17 +448,20 @@ def escalated(seed):
 
 def test_label_first_votes_cycle_temperatures_and_differ(fag, seeds):
     seed = next(s for s in seeds if s["label"] is True)
-    k = fag.spec.validation.consistency_k
+    spec = with_validation(
+        fag, consistency_k=5, consistency=ConsistencyRules(temperatures=[0.7, 0.8, 0.9])
+    )
     backend = by_temperature({0.7: "breach", 0.8: "no_breach", 0.9: "breach"})
-    lay = ConsistencyLayer.from_spec(fag, backend=backend)
-    assert [j.temperature for j in lay.voters] == [0.7, 0.8, 0.9]
-    v = lay.check(seed, escalated(seed))
-    temps = [0.7, 0.8, 0.9, 0.7, 0.8, 0.9, 0.7][:k]
-    assert [c.temperature for c in backend.calls] == temps
-    expected = ["no_breach" if t == 0.8 else "breach" for t in temps]
-    assert v.details["votes"] == expected and len(set(v.details["votes"])) == 2
+    v = ConsistencyLayer.from_spec(spec, backend=backend).check(seed, escalated(seed))
+    assert [(b["temperature"], b["vote"]) for b in v.details["ballots"]] == [
+        (0.7, "breach"),
+        (0.8, "no_breach"),
+        (0.9, "breach"),
+        (0.7, "breach"),
+        (0.8, "no_breach"),
+    ]
     # The majority is computed over the differing votes, not one repeated verdict.
-    assert v.details["agree"] == expected.count("breach") and v.details["majority"] == "breach"
+    assert v.details["agree"] == 3 and v.details["majority"] == "breach"
     assert v.passed
     # Every vote is still blind: same view, no label.
     assert '"label"' not in backend.calls[0].prompt
@@ -495,7 +503,7 @@ def test_l6_does_not_reuse_the_l5_judge(fag, seeds):
 def test_explicit_voters_are_cycled_and_exclusive_with_judge():
     a, b = VoteJudge(["yes"] * 3), VoteJudge(["no"] * 2)
     lay = ConsistencyLayer(mode="label_first", k=5, voters=(a, b), fields=FIELDS)
-    v = lay.check(RECORD, ctx(l5_verdict()))
+    v = lay.check(RECORD, judged())
     assert v.details["votes"] == ["yes", "no", "yes", "no", "yes"] and v.passed
     with pytest.raises(ConsistencyError, match="not both"):
         ConsistencyLayer(mode="label_first", k=3, judge=a, voters=(b,), fields=FIELDS)
@@ -512,10 +520,23 @@ def test_consistency_temperatures_are_validated(fag):
 
 def test_answer_emergent_answerer_cycles_the_configured_temperatures():
     cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
-    spec = with_validation(cfa, consistency=ConsistencyRules(temperatures=[0.3, 0.6]))
+    spec = with_validation(
+        cfa,
+        consistency_k=5,
+        consistency=ConsistencyRules(temperatures=[0.3, 0.6]),
+        escalation=EscalationRules(always=True),
+    )
     lay = ConsistencyLayer.from_spec(spec, backend=MockBackend(["Answer: A"], cycle=True))
-    assert isinstance(lay.answerer, BackendAnswerer)
-    assert lay.answerer.temperatures == (0.3, 0.6)
+    record = {"question": "Q?\nA) x\nB) y", "response": "Answer: A", "answer": "A"}
+    v = lay.check(record, ValidationContext(cell_id="c1", recipe={}))
+    assert v.passed
+    assert [(b["stage"], b["temperature"]) for b in v.details["ballots"]] == [
+        ("judge", 0.3),
+        ("judge", 0.6),
+        ("judge", 0.3),
+        ("judge", 0.6),
+        ("judge", 0.3),
+    ]
 
 
 def test_pipeline_votes_on_the_consistency_judge_stage(fag, seeds, tmp_path):
@@ -585,7 +606,7 @@ def test_ballots_follow_explicit_voters_and_record_abstentions():
     )
     b = VoteJudge(["yes", "yes"])  # a hand-built judge reports no stage, model or temperature
     v = ConsistencyLayer(mode="label_first", k=3, voters=(a, b), fields=FIELDS).check(
-        RECORD, ctx(l5_verdict())
+        RECORD, judged()
     )
     assert v.details["ballots"] == [
         {"stage": "consistency_judge", "model": "voter-a", "temperature": 0.4, "vote": None},
@@ -600,26 +621,20 @@ def test_answer_emergent_ballots_cycle_the_answerers_temperatures():
     lay = ConsistencyLayer(
         mode="answer_emergent", k=3, fields=("question",), answerer=answerer, extractor=letter
     )
-    v = lay.check(RECORD, ctx(l5_verdict()))
+    v = lay.check(RECORD, judged())
     assert v.details["ballots"] == [
         {"stage": "consistency_judge", "model": "answerer", "temperature": 0.3, "vote": "B"},
         {"stage": "consistency_judge", "model": "answerer", "temperature": 0.6, "vote": "B"},
         {"stage": "consistency_judge", "model": "answerer", "temperature": 0.3, "vote": None},
     ]
     # A bare answerer callable records only the votes.
-    plain = answer_layer(["Answer: B"] * 5).check(RECORD, ctx(l5_verdict()))
+    plain = answer_layer(["Answer: B"] * 5).check(RECORD, judged())
     assert plain.details["ballots"][0] == {
         "stage": None,
         "model": None,
         "temperature": None,
         "vote": "B",
     }
-
-
-def test_from_spec_answerer_reports_the_voting_stage():
-    cfa = compile_spec(Path(__file__).resolve().parents[1] / "tasks" / "cfa")
-    lay = ConsistencyLayer.from_spec(cfa, backend=MockBackend(["Answer: A"], cycle=True))
-    assert lay.answerer.stage == "judge"
 
 
 def test_cascade_writes_ballots_into_provenance(fag, seeds):

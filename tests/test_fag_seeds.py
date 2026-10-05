@@ -3,13 +3,12 @@
 import sys
 from pathlib import Path
 
-import jsonschema
 import pytest
 
 from sdgf.spec.compile import compile_spec
 from sdgf.spec.loader import load_task
-from sdgf.tasktypes.classification_spans import turn_structure_errors
-from sdgf.tasktypes.registry import REGISTRY
+from sdgf.validate.base import ValidationContext
+from sdgf.validate.l1_schema import SchemaLayer
 
 SDGF_DIR = Path(__file__).resolve().parents[1]
 FAG_DIR = SDGF_DIR / "tasks" / "fag"
@@ -66,19 +65,11 @@ def test_seed_ids_unique(seeds):
     assert len(set(ids)) == len(ids)
 
 
-def test_seeds_pass_output_schema(task, seeds):
-    tt = REGISTRY.resolve(task.spec.task)
-    schema = tt.output_schema(task.spec.output_schema)
+def test_seeds_pass_l1(seeds):
+    layer = SchemaLayer.from_spec(compile_spec(FAG_DIR))
     for s in seeds:
-        jsonschema.validate(s, schema)
-
-
-def test_seeds_pass_structural_validators(task, seeds):
-    tt = REGISTRY.resolve(task.spec.task)
-    for s in seeds:
-        assert turn_structure_errors(s, task.spec.output_schema.turns) == []
-        for validator in tt.default_validators():
-            assert validator(s) == [], s["conversation_id"]
+        verdict = layer.check(dict(s), ValidationContext())
+        assert verdict.passed, (s["conversation_id"], verdict.messages())
         assert len(s["messages"]) == s["turn_count"]
         assert s["messages"][-1]["role"] == "assistant"
 

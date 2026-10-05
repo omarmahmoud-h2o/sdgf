@@ -3,13 +3,11 @@ import copy
 import jsonschema
 import pytest
 
-from sdgf.spec.schema import FieldSpec, OutputSchemaSection, TaskSection, TurnStructure
+from sdgf.spec.schema import FieldSpec, OutputSchemaSection, TaskSection
 from sdgf.tasktypes.base import TaskTypeError
 from sdgf.tasktypes.classification_spans import (
     ClassificationSpans,
     span_turn_errors,
-    turn_numbering_errors,
-    turn_structure_errors,
 )
 from sdgf.tasktypes.registry import REGISTRY, get_task_type
 
@@ -21,8 +19,6 @@ RECORD = {
     "label": True,
     "spans": [{"turn": 2, "text": "ideal for your business", "category": "SUITABILITY"}],
 }
-
-STRUCTURE = TurnStructure(roles=["customer", "assistant"], first_role="customer")
 
 
 def _schema():
@@ -113,12 +109,6 @@ def test_span_missing_field_fails(field):
     assert not _valid(r)
 
 
-def test_span_turn_zero_fails():
-    r = _rec()
-    r["spans"][0]["turn"] = 0
-    assert not _valid(r)
-
-
 def test_label_of_wrong_type_fails():
     r = _rec()
     r["label"] = None
@@ -145,55 +135,8 @@ def test_default_validators_pass_valid_record():
         assert v(_rec()) == []
 
 
-def test_turn_numbering_gap():
-    r = _rec()
-    r["messages"][1]["turn"] = 3
-    errors = turn_numbering_errors(r)
-    assert errors and "expected 2" in errors[0]
-
-
 def test_span_cites_missing_turn():
     r = _rec()
     r["spans"][0]["turn"] = 5
     errors = span_turn_errors(r)
     assert errors and "turn=5" in errors[0]
-
-
-def test_turn_structure_valid():
-    assert turn_structure_errors(_rec(), STRUCTURE) == []
-
-
-def test_turn_structure_wrong_first_role():
-    r = _rec()
-    r["messages"][0]["role"], r["messages"][1]["role"] = "assistant", "customer"
-    errors = turn_structure_errors(r, STRUCTURE)
-    assert any("expected 'customer'" in e for e in errors)
-
-
-def test_turn_structure_not_alternating():
-    r = _rec()
-    r["messages"][1]["role"] = "customer"
-    errors = turn_structure_errors(r, STRUCTURE)
-    assert errors == ["messages[1] has role='customer', expected 'assistant'"]
-
-
-def test_turn_structure_unknown_role():
-    r = _rec()
-    r["messages"][1]["role"] = "agent"
-    assert "unknown role" in turn_structure_errors(r, STRUCTURE)[0]
-
-
-def test_turn_structure_numbered_from():
-    structure = TurnStructure(
-        roles=["customer", "assistant"], first_role="customer", numbered_from=0
-    )
-    assert any("expected 0" in e for e in turn_structure_errors(_rec(), structure))
-
-
-def test_turn_structure_non_alternating_allows_repeats():
-    structure = TurnStructure(
-        roles=["customer", "assistant"], first_role="customer", alternating=False
-    )
-    r = _rec()
-    r["messages"][1]["role"] = "customer"
-    assert turn_structure_errors(r, structure) == []

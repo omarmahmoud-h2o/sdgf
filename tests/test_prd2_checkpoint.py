@@ -1,12 +1,15 @@
 """PRD 2 checkpoint: a mock groundness run whose L6 votes differ across temperatures.
 
-The groundness task sets models.judge.temperature 0.0 and no models.consistency_judge, so
-L5 judges at 0.0 and L6 votes on the judge backend at the default vote temperatures
-(0.7, 0.8, 0.9). The blind judge mock recovers the truth from the conversation it wrote
+The groundness fixture spec (tests/fixtures/groundness, a snapshot of tasks/groundness with
+mock models and consistency_k 5) sets models.judge.temperature 0.0 and no
+models.consistency_judge, so L5 judges at 0.0 and L6 votes on the judge backend at the
+default vote temperatures (0.7, 0.8, 0.9). The blind judge mock recovers the truth from the conversation it wrote
 and flips its verdict at 0.8 only, so every escalated record gets votes that disagree
 with each other while the majority still matches the label. The run's L6 details and
-provenance record each vote's model and temperature. MockBackends only; skipped when
-tasks/groundness is absent.
+provenance record each vote's model and temperature. MockBackends only; never the live
+tasks/groundness spec, which the user edits. The fixture is built from tasks/groundness,
+which holds production-derived data, so like it the fixture stays local (git-ignored) and
+this module skips when it is absent.
 """
 
 import json
@@ -21,18 +24,15 @@ from sdgf.judge.llm_judge import RECORD_HEADER
 from sdgf.models.mock import MockBackend
 from sdgf.pipeline import Pipeline
 from sdgf.spec.compile import compile_spec
-from sdgf.spec.schema import ConsistencyRules
 from sdgf.store.provenance import split
 
-TASK = Path(__file__).resolve().parents[1] / "tasks" / "groundness"
-
-pytestmark = pytest.mark.skipif(
-    not (TASK / "task.yaml").exists(), reason="tasks/groundness not present"
-)
+TASK = Path(__file__).resolve().parent / "fixtures" / "groundness"
+pytestmark = pytest.mark.skipif(not TASK.exists(), reason="tests/fixtures/groundness not present")
 
 TARGET = 24
 FLIP = 0.8  # the one vote temperature at which the judge mock gets it wrong
-DEFAULT_TEMPERATURES = tuple(ConsistencyRules().temperatures)
+# consistency_k 5 cycling the default vote temperatures 0.7, 0.8, 0.9
+VOTE_TEMPERATURES = [0.7, 0.8, 0.9, 0.7, 0.8]
 
 
 @pytest.fixture(scope="module")
@@ -126,14 +126,17 @@ def l6_results(row):
     return [r for r in prov.layer_results if r.layer == "L6"]
 
 
-def test_groundness_votes_on_the_judge_at_the_default_temperatures(groundness, mock_run):
-    _, pipe, _ = mock_run
-    spec = groundness.spec
-    assert spec.models.judge.temperature == 0.0 and spec.models.consistency_judge is None
-    assert spec.validation.consistency_k > 1
-    l6 = pipe.cascade.layers[-1]
-    assert [v.temperature for v in l6.voters] == list(DEFAULT_TEMPERATURES)
-    assert FLIP in DEFAULT_TEMPERATURES
+def voted_results(result):
+    return [r for row in result.accepted for r in l6_results(row) if r.ballots]
+
+
+def test_groundness_votes_on_the_judge_at_the_default_temperatures(mock_run):
+    _, _, result = mock_run
+    voted = voted_results(result)
+    assert voted, "no record escalated to L6"
+    for res in voted:
+        assert [b.temperature for b in res.ballots] == VOTE_TEMPERATURES
+        assert {(b.stage, b.model) for b in res.ballots} == {("judge", "mock")}
 
 
 def test_mock_groundness_run_fills_every_cell(mock_run):
@@ -143,25 +146,17 @@ def test_mock_groundness_run_fills_every_cell(mock_run):
     assert set(labels) == {True, False}
 
 
-def test_escalated_records_get_votes_that_differ_across_temperatures(groundness, mock_run):
+def test_escalated_records_get_votes_that_differ_across_temperatures(mock_run):
     world, _, result = mock_run
-    k = groundness.spec.validation.consistency_k
-    temps = [DEFAULT_TEMPERATURES[i % len(DEFAULT_TEMPERATURES)] for i in range(k)]
-    voted = [r for row in result.accepted for r in l6_results(row) if r.ballots]
-    assert voted, "no record escalated to L6"
-    for res in voted:
+    for res in voted_results(result):
         assert res.outcome == "pass"
-        assert [b.temperature for b in res.ballots] == temps
-        assert {b.stage for b in res.ballots} == {"judge"}
-        votes = [b.vote for b in res.ballots]
-        assert len(set(votes)) == 2  # the 0.8 votes disagree with the others
         flipped = [b.vote for b in res.ballots if b.temperature == FLIP]
         kept = [b.vote for b in res.ballots if b.temperature != FLIP]
+        # the 0.8 votes disagree with the others, which still hold the majority
         assert len(set(flipped)) == len(set(kept)) == 1 and flipped[0] != kept[0]
-        # The majority is over the differing votes, and it matches the label.
-        assert len(kept) > len(flipped)
+        assert (len(kept), len(flipped)) == (3, 2)
     # L5 judged at 0.0, L6 at the vote temperatures: never one verdict repeated K times.
-    assert set(world.judge_temperatures) == {0.0, *DEFAULT_TEMPERATURES}
+    assert set(world.judge_temperatures) == {0.0, 0.7, 0.8, 0.9}
 
 
 def test_unescalated_records_take_no_votes(mock_run):

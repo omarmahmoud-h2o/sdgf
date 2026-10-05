@@ -14,7 +14,10 @@ task:
   type: classification_spans
   generation_mode: label_first
   description: Toy task for compile tests.
-output_schema: {}
+output_schema:
+  turns:
+    roles: [customer, assistant]
+    first_role: customer
 rubric:
   verdict:
     values: [pass, fail]

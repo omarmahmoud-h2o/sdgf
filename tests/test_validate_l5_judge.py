@@ -39,8 +39,10 @@ class FakeJudge(Judge):
 
     name = "fake"
 
-    def __init__(self, verdict="yes", conf=0.9, reason="because", writes=True, fail=False):
-        super().__init__(schema())
+    def __init__(
+        self, verdict="yes", conf=0.9, reason="because", writes=True, fail=False, policy="never"
+    ):
+        super().__init__(schema(policy))
         self.verdict, self.conf, self.reason, self.fail = verdict, conf, reason, fail
         self.writes_reasons = writes
         self.seen: list[dict] = []
@@ -69,26 +71,6 @@ def layer(judge=None, **kw):
 
 
 # ── fidelity ─────────────────────────────────────────────────────
-
-
-def test_agreeing_confident_verdict_passes_with_details():
-    v = layer().check(RECORD, CTX)
-    assert v.passed and v.errors == ()
-    assert v.details["agrees"] is True
-    assert v.details["low_confidence"] is False
-    assert v.details["escalate"] is False
-    assert v.details["judge"]["verdict"] == "yes"
-    assert "reason" not in v.details
-
-
-def test_disagreement_is_repairable_with_expected_verdict():
-    v = layer(FakeJudge(verdict="no")).check(RECORD, CTX)
-    assert v.repairable and v.codes == ("judge_disagrees",)
-    issue = v.errors[0]
-    assert issue.path == "verdict"
-    assert issue.details["verdict"] == "no" and issue.details["expected"] == ["yes"]
-    assert "'no'" in issue.message and "'yes'" in issue.message
-    assert v.details["agrees"] is False
 
 
 def test_verdict_outside_the_label_map_never_agrees():
@@ -137,19 +119,6 @@ def test_layer_needs_a_visible_field():
 # ── low confidence and review ────────────────────────────────────
 
 
-def test_low_confidence_goes_to_review_when_enabled():
-    sink = ListReviewSink()
-    v = layer(FakeJudge(conf=0.4), review=sink).check(RECORD, CTX)
-    assert v.hard and v.codes == ("sent_to_review",)
-    assert v.details["low_confidence"] is True
-    [item] = sink.items
-    assert item.code == "low_confidence" and item.layer == "L5"
-    assert item.cell_id == "c1" and item.intended_label == "yes"
-    assert "_provenance" not in item.record
-    assert item.judge["verdict"] == "yes"
-    assert item.to_dict()["record"]["question"] == "Q?"
-
-
 def test_low_confidence_disagreement_also_goes_to_review():
     sink = ListReviewSink()
     v = layer(FakeJudge(verdict="no", conf=0.2), review=sink).check(RECORD, CTX)
@@ -196,12 +165,6 @@ def test_escalation_on_hard_and_contestable(facts, rules, escalate):
 # ── judge failures ───────────────────────────────────────────────
 
 
-def test_unusable_judge_output_is_a_hard_drop():
-    v = layer(FakeJudge(fail=True)).check(RECORD, CTX)
-    assert v.hard and v.codes == ("judge_error",)
-    assert v.details["judge"] is None
-
-
 def test_unusable_judge_output_goes_to_review_when_enabled():
     sink = ListReviewSink()
     v = layer(FakeJudge(fail=True), review=sink).check(RECORD, CTX)
@@ -213,8 +176,7 @@ def test_unusable_judge_output_goes_to_review_when_enabled():
 
 
 def with_reasons(policy, verdict="yes", conf=0.9, fallback=None, writes=True):
-    judge = FakeJudge(verdict=verdict, conf=conf, writes=writes)
-    judge.schema = schema(policy)
+    judge = FakeJudge(verdict=verdict, conf=conf, writes=writes, policy=policy)
     return judge, layer(judge, fallback_judge=fallback)
 
 
@@ -254,8 +216,7 @@ def test_reasons_need_a_judge_that_writes_them():
 
 
 def test_reason_goes_into_the_review_item():
-    judge = FakeJudge(conf=0.2)
-    judge.schema = schema("flagged")
+    judge = FakeJudge(conf=0.2, policy="flagged")
     sink = ListReviewSink()
     layer(judge, review=sink).check(RECORD, CTX)
     assert sink.items[0].reason == "because"
@@ -392,8 +353,149 @@ def test_from_spec_takes_the_label_field_from_the_task_type():
 
 
 def test_escalation_always_escalates_every_record():
-    _, lay = emergent_layer("yes")
-    lay.escalation = EscalationRules(always=True, on_hard_cells=False, on_contestable=False)
+    rules = EscalationRules(always=True, on_hard_cells=False, on_contestable=False)
+    lay = layer(
+        FakeJudge("yes"),
+        fields=("question",),
+        label_field="answer",
+        answer_emergent=True,
+        escalation=rules,
+    )
     record = {"question": "Q?", "response": "Answer: yes", "answer": "yes"}
     v = lay.check(record, ValidationContext(cell_id="c1", recipe={}))
     assert v.passed and v.details["escalate"] and not v.details["low_confidence"]
+
+
+# ── the outcome table at the seam, on a FAG-shaped rubric ────────
+
+FAG_RUBRIC = RubricSection(
+    verdict={"values": ["breach", "no_breach"]},
+    criteria=[
+        {"name": "advice_tier", "values": ["FACTUAL_INFORMATION", "GENERAL_ADVICE"]},
+        {"name": "realism", "min": 1, "max": 5},
+    ],
+)
+FAG_LABELS = {"breach": True, "no_breach": False}
+CONVERSATION = [
+    {"role": "customer", "content": "Should I put our surplus into a term deposit?"},
+    {"role": "assistant", "content": "For your business, the 12-month term deposit suits you."},
+]
+FAG_RECORD = {
+    "messages": CONVERSATION,
+    "label": True,
+    "spans": [{"turn": 2, "text": "suits you"}],
+    "_provenance": {"attempt": 1},
+}
+
+
+class ScriptedJudge(Judge):
+    """A judge whose answer is scripted: a verdict and confidences, or a parse error.
+    It records the views it was asked to explain."""
+
+    name = "scripted"
+    writes_reasons = True
+
+    def __init__(
+        self,
+        verdict="breach",
+        conf=0.9,
+        *,
+        tier_conf=0.9,
+        error=None,
+        reason_required="never",
+        reason="the assistant recommends a product",
+    ):
+        rubric = FAG_RUBRIC.model_copy(update={"reason_required": reason_required})
+        super().__init__(compile_rubric(rubric))
+        self.verdict, self.conf, self.tier_conf = verdict, conf, tier_conf
+        self.error, self.reason = error, reason
+        self.explained: list[dict] = []
+
+    def judge(self, record):
+        if self.error is not None:
+            raise self.error
+        return JudgeResult(
+            self.verdict,
+            {"advice_tier": "GENERAL_ADVICE", "realism": 4},
+            {"verdict": self.conf, "advice_tier": self.tier_conf, "realism": 0.9},
+        )
+
+    def explain(self, record, result):
+        self.explained.append(record)
+        return self.reason
+
+
+def fag_check(judge, label=True, *, escalation=None, review=None):
+    lay = JudgeLayer(
+        judge, fields=("messages",), labels=FAG_LABELS, escalation=escalation, review=review
+    )
+    return lay.check(FAG_RECORD, ValidationContext(cell_id="c7", recipe={"label": label}))
+
+
+def test_a_confident_agreeing_verdict_passes_the_record_without_escalating():
+    v = fag_check(ScriptedJudge("breach", 0.9), label=True)
+    assert v.outcome == "pass" and v.errors == ()
+    assert v.details["agrees"] is True
+    assert v.details["escalate"] is False
+    assert v.details["judge"]["verdict"] == "breach"
+    assert "reason" not in v.details
+
+
+def test_a_confident_disagreeing_verdict_is_sent_back_naming_both_verdicts():
+    v = fag_check(ScriptedJudge("no_breach", 0.9), label=True)
+    assert v.outcome == "fail_repairable" and v.codes == ("judge_disagrees",)
+    issue = v.errors[0]
+    assert issue.path == "verdict"
+    assert issue.details["verdict"] == "no_breach"
+    assert issue.details["expected"] == ["breach"]
+    assert "'no_breach'" in issue.message and "'breach'" in issue.message
+
+
+@pytest.mark.parametrize("conf, low", [(0.7, False), (0.69, True)])
+def test_confidence_at_the_low_confidence_threshold_is_not_low(conf, low):
+    rules = EscalationRules(low_confidence=0.7)
+    v = fag_check(ScriptedJudge("breach", conf), label=True, escalation=rules)
+    assert v.details["low_confidence"] is low
+
+
+def test_low_confidence_with_review_on_drops_the_record_into_the_review_queue():
+    sink = ListReviewSink()
+    v = fag_check(ScriptedJudge("breach", 0.4), label=True, review=sink)
+    assert v.outcome == "fail_hard" and v.codes == ("sent_to_review",)
+    [item] = sink.items
+    assert item.code == "low_confidence" and item.intended_label is True
+    assert item.layer == "L5" and item.cell_id == "c7"
+    assert item.judge["verdict"] == "breach"
+    assert "_provenance" not in item.record
+    assert item.record["messages"] == CONVERSATION
+
+
+def test_low_confidence_with_review_off_passes_and_escalates_to_extra_votes():
+    v = fag_check(ScriptedJudge("breach", 0.4), label=True, review=None)
+    assert v.outcome == "pass"
+    assert v.details["escalate"] is True
+
+
+def test_a_low_criterion_confidence_does_not_make_the_verdict_low_confidence():
+    v = fag_check(ScriptedJudge("breach", 0.9, tier_conf=0.1), label=True)
+    assert v.details["low_confidence"] is False
+
+
+def test_an_unparseable_judge_answer_with_review_off_drops_the_record_as_judge_error():
+    judge = ScriptedJudge(error=JudgeParseError(["<root>: bad"]))
+    v = fag_check(judge, label=True, review=None)
+    assert v.outcome == "fail_hard" and v.codes == ("judge_error",)
+    assert v.details["judge"] is None
+    assert "<root>: bad" in v.errors[0].message
+
+
+def test_an_int_fixed_label_is_not_met_by_a_verdict_that_means_true():
+    v = fag_check(ScriptedJudge("breach", 0.9), label=1)
+    assert v.codes == ("judge_disagrees",)
+
+
+def test_a_flagged_record_gets_a_blind_reason_appended_to_the_sent_back_message():
+    judge = ScriptedJudge("no_breach", 0.9, reason_required="flagged", reason="no product named")
+    v = fag_check(judge, label=True)
+    assert judge.explained == [{"messages": CONVERSATION}]
+    assert v.errors[0].message.endswith("Judge's reason: no product named")
