@@ -114,6 +114,7 @@ def governance_report(
     records: Sequence[Mapping[str, Any]],
     *,
     held_out_check: bool | None = None,
+    trace_sinks: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     tools: dict[str, dict[str, Any]] = {}
     for r in records:
@@ -134,6 +135,8 @@ def governance_report(
         "held_out_check": held_out_check,
         "endpoints": [dict(e) for e in endpoints],
         "external_endpoints": [dict(e) for e in endpoints if e["hosting"] == "provider_api"],
+        # services that received run data for tracing (sdgf run --trace), not models
+        "trace_sinks": [dict(t) for t in trace_sinks],
         "tools": {
             name: {"calls": t["calls"], "sensitivity": sorted(t["sensitivity"])}
             for name, t in sorted(tools.items())
@@ -207,6 +210,13 @@ def dataset_card(
         "",
         f"External endpoints that received data: {len(external)}"
         + (" — " + ", ".join(f"{e['backend']}:{e['model']}" for e in external) if external else ""),
+    ]
+    for t in governance.get("trace_sinks", ()):
+        out.append(
+            f"Traced to {t['sink']} ({t['endpoint']}, project `{t['project']}`, "
+            f"{t['content']} content)."
+        )
+    out += [
         "",
         "## Release gate",
         "",
@@ -307,6 +317,7 @@ def write_release(
             endpoints,
             records,
             held_out_check=intake.get("held_out_check"),
+            trace_sinks=run.read_stage("trace_sinks") if run.has_stage("trace_sinks") else (),
         )
         with (
             (tmp / DATASET).open("w", encoding="utf-8") as data,

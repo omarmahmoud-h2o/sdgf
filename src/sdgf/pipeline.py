@@ -134,6 +134,14 @@ from sdgf.validate.l6_consistency import (
     ConsistencyLayer,
     vote_stage,
 )
+from sdgf.tracing import (
+    NULL_REF,
+    TRACE_SINKS_STAGE,
+    NullTracer,
+    SpanRef,
+    TracedBackend,
+    Tracer,
+)
 from sdgf.validate.repair import GENERATE_STAGE, Drop, DropLog, RepairLoop
 
 log = logging.getLogger(__name__)
@@ -229,6 +237,8 @@ class Slot:
     usage: UsageLedger = field(default_factory=UsageLedger)
     attempts: int = 0
     history: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    trace: SpanRef = NULL_REF  # the candidate's root span, ended by settle
+    trace_feedback: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -277,6 +287,7 @@ class Pipeline:
         answerer: Answerer | None = None,
         tool_registry: ToolRegistry | None = None,
         ignore_unused_overrides: bool = False,
+        tracer: Tracer | None = None,
     ):
         # Stage 0: spec schema and hook signatures are checked on load; the task type
         # and its generation mode are resolved here, before any model is built.
@@ -293,6 +304,8 @@ class Pipeline:
         self.plan_seed = plan_seed
         self.max_attempts_per_cell = max_attempts_per_cell
         self.held_out_paths = list(held_out_paths) if held_out_paths is not None else None
+        # Tracing is run-time only (never in the spec), so toggling it keeps spec_version.
+        self.tracer: Tracer = tracer if tracer is not None else NullTracer()
 
         configured = self.compiled.spec.validation.layers
         if layers is None:
@@ -350,7 +363,7 @@ class Pipeline:
                 )
         self.meter = UsageMeter()
         self._metered: dict[str, ModelBackend] = {
-            st: MeteredBackend(self.models.backend(st), st, self.meter, pricing[st])
+            st: MeteredBackend(self._traced(st), st, self.meter, pricing[st])
             for st in self.used_stages
         }
         # Concurrency: one pool sized for the busiest stage, each stage's backend capped
@@ -371,7 +384,9 @@ class Pipeline:
         gateway = None
         if self.compiled.spec.tools:
             self.tool_cache = ToolCache.for_store(self.store, self.compiled.spec_version)
-            gateway = ToolGateway(tool_registry.for_task(self.compiled.spec), self.tool_cache)
+            gateway = ToolGateway(
+                tool_registry.for_task(self.compiled.spec), self.tool_cache, tracer=self.tracer
+            )
         self.generator = Generator(
             self.compiled,
             self._bounded["generator"],
@@ -391,7 +406,11 @@ class Pipeline:
         overlap = implementations.get("L4")
         assert overlap is None or isinstance(overlap, OverlapLayer)
         self.overlap: OverlapLayer | None = overlap
-        self.cascade = Cascade.from_config(self.layers, implementations)
+        self.cascade = Cascade.from_config(self.layers, implementations, tracer=self.tracer)
+
+    def _traced(self, stage: str) -> ModelBackend:
+        backend = self.models.backend(stage)
+        return TracedBackend(backend, stage, self.tracer) if self.tracer.enabled else backend
 
     def _plan_cached(self) -> bool:
         stage = plan_stage_name(self.compiled, self.target_size, self.plan_seed)
@@ -498,6 +517,16 @@ class Pipeline:
             "models": self.models.endpoints(),
         }
 
+    def _record_trace_sink(self, run: RunDir) -> None:
+        """Tracing sends run data to an outside service: record it as a data destination
+        for this run (governance_report.json lists it), once per distinct sink."""
+        sink = self.tracer.sink if self.tracer.enabled else None
+        if sink is None:
+            return
+        sinks = run.read_stage(TRACE_SINKS_STAGE) if run.has_stage(TRACE_SINKS_STAGE) else []
+        if dict(sink) not in sinks:
+            run.write_stage(TRACE_SINKS_STAGE, [*sinks, dict(sink)])
+
     def plan(self) -> CoveragePlan:
         """Stage 1: the shared coverage plan for this spec_version, built once if absent."""
         backend = self._metered.get("expansion")
@@ -534,6 +563,7 @@ class Pipeline:
         prior_usage is the usage of earlier rounds, which counts against the budget."""
         run = self.store.open_run(self.compiled.spec_version, run_id)
         run.stage("spec", self._intake_summary)
+        self._record_trace_sink(run)
         target = self.target_size
         cells = cells_from_json(
             run.stage("cells", lambda: cells_to_json(self.approved_plan().cells))
@@ -612,6 +642,7 @@ class Pipeline:
                     self.overlap.commit_staged()
                 write_usage(run, base, ledger, time.monotonic() - started)
 
+        self.tracer.flush()
         usage = write_usage(run, base, ledger, time.monotonic() - started)
         snapshot = scheduler.snapshot()
         snapshot["usage_by_stage"] = ledger.to_dict()
@@ -748,6 +779,15 @@ class Pipeline:
         if self.reviews is not None:
             for item in slot.reviews:
                 self.reviews.target.submit(item)
+        last = slot.drops[-1] if slot.drops and record is None else None
+        self.tracer.settle(
+            slot.trace,
+            outcome="accepted" if record is not None else "dropped",
+            layer=last.layer if last is not None else None,
+            codes=last.codes if last is not None else (),
+            attempts=slot.attempts,
+            feedback=slot.trace_feedback,
+        )
         if record is None:
             scheduler.reject(slot.cell.id, slot.reason)
             return None
@@ -764,6 +804,20 @@ class Pipeline:
             usage = stack.enter_context(self.meter.capture())
             slot = Slot(cell, None, "", local.drops, reviews, usage)
             recipe = self.generator.recipe(cell.params, random.Random(seed))
+            slot.trace = stack.enter_context(
+                self.tracer.candidate(
+                    run_id=run_id,
+                    cell_id=cell.id,
+                    seed=seed,
+                    recipe=recipe,
+                    metadata={
+                        "task": self.compiled.spec.task.name,
+                        "spec_version": self.compiled.spec_version,
+                        "cell_params": dict(cell.params),
+                    },
+                    tags=(f"task:{self.compiled.spec.task.name}",),
+                )
+            )
             if recipe is None:
                 local.drops.append(
                     Drop(
@@ -781,9 +835,11 @@ class Pipeline:
             prov = ProvenanceBuilder(
                 self.compiled.spec_version, cell.id, seed, self.models.endpoints(), run_id
             )
-            loop = RepairLoop(self.generator, self.cascade, drop_log=local)
+            loop = RepairLoop(self.generator, self.cascade, drop_log=local, tracer=self.tracer)
             outcome = loop.run(cell.id, recipe, prompt, prov)
             slot.attempts, slot.history = outcome.attempts, tuple(outcome.history)
+            if self.tracer.enabled and outcome.result is not None:
+                slot.trace_feedback = trace_feedback(outcome.result)
             if outcome.record is None:
                 drop = outcome.drop
                 assert drop is not None
@@ -799,6 +855,20 @@ class Pipeline:
             # A JSON round trip makes the returned record identical to the stored line.
             slot.record = json.loads(json.dumps(attach(record, provenance)))
             return slot
+
+
+def trace_feedback(result: Any) -> dict[str, Any]:
+    """Feedback keys for a candidate's trace from its last cascade run: whether the judge
+    agreed and how sure it was (L5), and how L6 decided."""
+    out: dict[str, Any] = {}
+    for verdict in result.verdicts:
+        details = verdict.details
+        if verdict.layer == "L5" and isinstance(details.get("judge"), Mapping):
+            out["l5_agrees"] = details.get("agrees")
+            out["l5_confidence"] = (details["judge"].get("confidence") or {}).get("verdict")
+        elif verdict.layer == "L6":
+            out["l6_method"] = details.get("method")
+    return out
 
 
 def write_usage(

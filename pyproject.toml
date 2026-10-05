@@ -24,6 +24,7 @@ embeddings = ["sentence-transformers"]
 retrieval = ["rank-bm25"]
 dev = ["pytest", "ruff"]
 docs = ["markdown>=3.5"]
+tracing = ["langsmith>=0.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

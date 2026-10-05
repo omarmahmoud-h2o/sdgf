@@ -328,6 +328,47 @@ all invocations. `max_cost_usd` is an error if any stage in use is unpriced.
    small mock run: `--target-size 20 --backends your_module:factory`. Then add tests
    under `tests/` that use `MockBackend` only.
 
+## Tracing with LangSmith
+
+`run`, `resume` and `release` accept `--trace langsmith`. Every candidate becomes one
+LangSmith trace, so you can follow each model call and see how each record went through
+the checks:
+
+```
+candidate <cell>                         fixed facts in, outcome out (accepted | dropped)
+├─ attempt 0
+│  ├─ generate → generator:<backend>     prompt, reply, tokens; tool:<name> for tool calls
+│  ├─ L1 schema … Ln                     outcome, issue codes, details (stops at the first failure)
+├─ attempt 1                             inputs include the repair feedback
+│  ├─ …
+│  ├─ L5 judge → judge:<backend>         verdict, scores, confidence, agrees, escalate
+│  └─ L6 extra votes → k voter calls     method, ballots, majority
+```
+
+Each trace's root also carries feedback keys to filter and chart on: `accepted` (0/1),
+`attempts`, `failed_layer`, `l5_agrees`, `l5_confidence` and `l6_method`. A record dropped
+at settle (an L4 near-duplicate within its wave) ends `dropped` even though its own checks
+passed.
+
+```bash
+pip install -e '.[tracing]'
+export LANGSMITH_API_KEY=...            # required
+export LANGSMITH_ENDPOINT=...           # optional; default https://api.smith.langchain.com (US)
+python -m sdgf.cli run tasks/fag --store /tmp/sdgf-store --trace langsmith \
+    [--trace-project NAME] [--trace-tags TAG ...]
+```
+
+The project defaults to `sdgf-<task name>`. Tracing is run-time only, like `--held-out`:
+it isn't saved with the run or in `task.yaml`, so `spec_version` doesn't change and a run
+can be resumed with tracing on or off. It never changes the artefacts, and a tracing
+failure is logged as a warning without stopping the run.
+
+**Data destination.** Traces carry full content: prompts, replies, records, judge
+reasons and tool results. A traced run records LangSmith in its `trace_sinks.json`, and a
+release lists it under `trace_sinks` in `governance_report.json` and in the dataset card.
+Held-out matches are scrubbed: an L4 issue against the held-out set reaches a span without
+its key or message. `sdgf plan` and judge calibration aren't traced.
+
 ## Optional adapters
 
 Heavy engines are imported lazily, only when you build their adapter. The core and the
@@ -340,6 +381,7 @@ test suite never need them.
 | `embeddings` | `sentence-transformers` | `validate.l4_overlap.sentence_transformers_embedder`, for L4 embedding overlap and the `semantic_diversity_min` cluster entropy (the default is character-shingle Jaccard) |
 | `docs` | `markdown` | not an adapter: `docs/build_guide.py` uses it to build `docs/sdgf-guide.html` |
 | `retrieval` | `rank-bm25` | not required: `coverage/retrieval.py` is a pure-Python BM25 that scores the same as `rank_bm25.BM25Okapi` |
+| `tracing` | `langsmith` | `tracing.LangSmithTracer`, used by `--trace langsmith` (see [Tracing with LangSmith](#tracing-with-langsmith)) |
 
 Install an extra with `pip install -e '.[pii]'`. Model SDKs work the same way:
 `openai_compat` needs only the standard library, `anthropic` uses `anthropic`, `vllm`

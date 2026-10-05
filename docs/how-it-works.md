@@ -255,6 +255,16 @@ A real FAG drop from a 15-record local run went through three attempts:
 Each re-prompt fixed the previous error, then the record failed a later check. After 2
 re-prompts it was dropped.
 
+### Watching a run in LangSmith
+
+`--trace langsmith` turns this picture into one trace per candidate: an `attempt N` span
+per try, with a `generate` span for the model call and one span per check that ran,
+carrying its outcome, codes and details. The trace ends with whether the record was kept,
+and feedback keys (`accepted`, `attempts`, `failed_layer`, `l5_agrees`, `l5_confidence`,
+`l6_method`) let you filter, for example, every candidate dropped at L5. Traces carry
+full content and LangSmith is recorded as a data destination; see the README section
+"Tracing with LangSmith".
+
 ## The measurements
 
 Computed overall and per cell, from the kept records, the drop log, the usage log, and a
@@ -290,6 +300,7 @@ waived.
     cli_options.json                  options reused by resume / evaluate / release
     review.jsonl review_decisions.jsonl   when hitl.review_flagged is on
     rounds.json shortfall.json/.md    release rounds; the last failed release check
+    trace_sinks.json                  tracing services that received this run's data (--trace)
 
 <releases>/<task>/<version>/
   dataset.jsonl provenance.jsonl dataset_card.md governance_report.json metrics.json manifest.json

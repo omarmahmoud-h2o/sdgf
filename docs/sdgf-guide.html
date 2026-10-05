@@ -590,7 +590,7 @@ previous one passed, because a broken record makes later steps report noise:</p>
 <li>Turns: numbered from 1, only known roles, alternating, starting with the customer.</li>
 <li>Task type rules: for conversations, each span cites a turn that exists. For Q&amp;A, the response contains an answer that can be read.</li>
 </ol>
-<div class="compare" data-show="fag"><div class="seg" role="group" aria-label="Example"><button type="button" data-show="fag" aria-pressed="true">FAG</button><button type="button" data-show="cfa" aria-pressed="false">CFA</button><button type="button" data-show="both" aria-pressed="false">Side by side</button></div><div class="cmp-head"><div></div><div data-side="fag">FAG</div><div data-side="cfa">CFA</div></div><div class="cmp-row"><div class="cmp-label">Fails when</div><div class="cmp-cell" data-side="fag">The model returns the conversation but leaves out <code>severity</code>, <code>signal_categories</code> and four other required fields.</div><div class="cmp-cell" data-side="cfa">The <code>answer</code> field says C but the response ends <code>Answer: B</code>, or the question lists only one option.</div></div><div class="cmp-row"><div class="cmp-label">Issue codes</div><div class="cmp-cell" data-side="fag"><code>schema_required</code>, <code>turn_numbering</code>, <code>role_alternation</code>, <code>first_role</code></div><div class="cmp-cell" data-side="cfa"><code>response_answer_errors</code>, <code>option_errors</code></div></div><div class="cmp-row"><div class="cmp-label">Result</div><div class="cmp-cell" data-side="fag">sent back</div><div class="cmp-cell" data-side="cfa">sent back</div></div></div></section><section class="layer-pane" id="pane-L2" data-layer="L2" hidden><h3 id="how-it-works-l2-rules">L2 Rules</h3><p>Checks the task's own rules, written in <code>task.yaml</code> and <code>hooks.py</code>. All three parts run
+<div class="compare" data-show="fag"><div class="seg" role="group" aria-label="Example"><button type="button" data-show="fag" aria-pressed="true">FAG</button><button type="button" data-show="cfa" aria-pressed="false">CFA</button><button type="button" data-show="both" aria-pressed="false">Side by side</button></div><div class="cmp-head"><div></div><div data-side="fag">FAG</div><div data-side="cfa">CFA</div></div><div class="cmp-row"><div class="cmp-label">Fails when</div><div class="cmp-cell" data-side="fag">The model returns the conversation but leaves out <code>severity</code>, <code>signal_categories</code> and four other required fields.</div><div class="cmp-cell" data-side="cfa">The <code>answer</code> field says C but the response ends <code>Answer: B</code>, or the question lists only one option.</div></div><div class="cmp-row"><div class="cmp-label">Issue codes</div><div class="cmp-cell" data-side="fag"><code>schema_required</code>, <code>turn_numbering</code>, <code>role_alternation</code>, <code>first_role</code></div><div class="cmp-cell" data-side="cfa"><code>response_answer</code>, <code>option</code></div></div><div class="cmp-row"><div class="cmp-label">Result</div><div class="cmp-cell" data-side="fag">sent back</div><div class="cmp-cell" data-side="cfa">sent back</div></div></div></section><section class="layer-pane" id="pane-L2" data-layer="L2" hidden><h3 id="how-it-works-l2-rules">L2 Rules</h3><p>Checks the task's own rules, written in <code>task.yaml</code> and <code>hooks.py</code>. All three parts run
 every time, so a single re-prompt lists every error:</p>
 <ol>
 <li>Keyword rules (<code>validation.rules</code>): words that must or must not appear, optionally only in some roles or fields.</li>
@@ -657,6 +657,14 @@ writer's instructions (annotate every claim, the fixed parameters) should set
 judge-only worked examples (a record view, the expected verdict, optional scores and a
 note) under <code>## Worked examples</code>. Neither ever reaches the generation prompt, and stage 0
 scans the examples for PII and toxicity like the seeds.</p>
+<p>The judge is either a text model behind <code>LLMJudge</code>, which is prompted for the rubric as
+JSON, or Jev (<code>backend: jev</code>), a decision model that answers typed questions. For Jev the
+rubric is compiled into one request per record: the verdict and each enum criterion are
+Choice questions, each integer criterion a Score (a Choice past 10 levels). The state it
+sees is the same context, worked examples and blind record view. Both return the same
+verdict, scores and confidence, so everything below applies to either. Jev's confidence
+comes from its answer distribution rather than the model's own estimate, but it is still
+untrusted until a calibration passes.</p>
 <div class="table-wrap"><table>
 <thead>
 <tr>
@@ -772,6 +780,14 @@ the per-record tool budget includes re-prompts.</p>
 </table></div>
 <p>Each re-prompt fixed the previous error, then the record failed a later check. After 2
 re-prompts it was dropped.</p>
+<h3 id="how-it-works-watching-a-run-in-langsmith">Watching a run in LangSmith</h3>
+<p><code>--trace langsmith</code> turns this picture into one trace per candidate: an <code>attempt N</code> span
+per try, with a <code>generate</code> span for the model call and one span per check that ran,
+carrying its outcome, codes and details. The trace ends with whether the record was kept,
+and feedback keys (<code>accepted</code>, <code>attempts</code>, <code>failed_layer</code>, <code>l5_agrees</code>, <code>l5_confidence</code>,
+<code>l6_method</code>) let you filter, for example, every candidate dropped at L5. Traces carry
+full content and LangSmith is recorded as a data destination; see the README section
+"Tracing with LangSmith".</p>
 <h2 id="how-it-works-the-measurements">The measurements</h2>
 <p>Computed overall and per cell, from the kept records, the drop log, the usage log, and a
 calibration if there is one:</p>
@@ -854,6 +870,7 @@ waived.</p>
     cli_options.json                  options reused by resume / evaluate / release
     review.jsonl review_decisions.jsonl   when hitl.review_flagged is on
     rounds.json shortfall.json/.md    release rounds; the last failed release check
+    trace_sinks.json                  tracing services that received this run's data (--trace)
 
 &lt;releases&gt;/&lt;task&gt;/&lt;version&gt;/
   dataset.jsonl provenance.jsonl dataset_card.md governance_report.json metrics.json manifest.json

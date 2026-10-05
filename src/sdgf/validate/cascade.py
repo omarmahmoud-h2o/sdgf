@@ -17,6 +17,7 @@ from typing import Iterable, Mapping, Sequence
 
 from sdgf.spec.schema import ALL_LAYERS, LayerName, ValidationSection
 from sdgf.store.provenance import LayerOutcome, ProvenanceBuilder
+from sdgf.tracing import NullTracer, Tracer, layer_outputs
 from sdgf.validate.base import (
     Layer,
     LayerVerdict,
@@ -64,8 +65,19 @@ class CascadeResult:
         return tuple(v.layer for v in self.verdicts)
 
 
+# Span names for the check layers (README "Tracing with LangSmith").
+LAYER_SPAN_NAMES: dict[str, str] = {
+    "L1": "L1 schema",
+    "L2": "L2 rules",
+    "L3": "L3 safety scan",
+    "L4": "L4 copy check",
+    "L5": "L5 judge",
+    "L6": "L6 extra votes",
+}
+
+
 class Cascade:
-    def __init__(self, layers: Sequence[Layer]):
+    def __init__(self, layers: Sequence[Layer], *, tracer: Tracer | None = None):
         names = [layer.name for layer in layers]
         unknown = [n for n in names if n not in ALL_LAYERS]
         if unknown:
@@ -75,12 +87,15 @@ class Cascade:
         if names != sorted(names, key=ALL_LAYERS.index):
             raise CascadeError(f"layers must run cheapest first, in order L1..L6: {names}")
         self.layers: tuple[Layer, ...] = tuple(layers)
+        self.tracer: Tracer = tracer if tracer is not None else NullTracer()
 
     @classmethod
     def from_config(
         cls,
         config: ValidationSection | Sequence[str],
         available: Mapping[str, Layer] | Iterable[Layer],
+        *,
+        tracer: Tracer | None = None,
     ) -> Cascade:
         """Pick the configured layers, in configured order, from the implementations given.
 
@@ -99,7 +114,7 @@ class Cascade:
         for name, layer in available.items():
             if layer.name != name:
                 raise CascadeError(f"layer registered as {name!r} reports name {layer.name!r}")
-        return cls([available[name] for name in order])
+        return cls([available[name] for name in order], tracer=tracer)
 
     @property
     def names(self) -> tuple[LayerName, ...]:
@@ -114,7 +129,11 @@ class Cascade:
         context = context or ValidationContext()
         verdicts: list[LayerVerdict] = []
         for layer in self.layers:
-            verdict = layer.check(record, replace(context, previous=tuple(verdicts)))
+            name = LAYER_SPAN_NAMES.get(layer.name, layer.name)
+            with self.tracer.span(name, "chain", {"attempt": context.attempt}) as span:
+                verdict = layer.check(record, replace(context, previous=tuple(verdicts)))
+                if isinstance(verdict, LayerVerdict):
+                    span.end(outputs=layer_outputs(verdict))
             if not isinstance(verdict, LayerVerdict):
                 raise CascadeError(f"layer {layer.name} returned {type(verdict).__name__}")
             if verdict.layer != layer.name:

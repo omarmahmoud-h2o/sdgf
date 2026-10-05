@@ -34,6 +34,7 @@ from sdgf.models.base import ToolCall, ToolSpec
 from sdgf.store.provenance import ToolTraceEntry
 from sdgf.tools.cache import ToolCache, ToolCacheError
 from sdgf.tools.registry import TaskTools
+from sdgf.tracing import NullTracer, Tracer
 
 TokenCounter = Callable[[Any], int]
 
@@ -84,10 +85,12 @@ class ToolGateway:
         tools: TaskTools,
         cache: ToolCache | None = None,
         token_counter: TokenCounter = estimate_tokens,
+        tracer: Tracer | None = None,
     ):
         self.tools = tools
         self.cache = cache if cache is not None else ToolCache()
         self.token_counter = token_counter
+        self.tracer: Tracer = tracer if tracer is not None else NullTracer()
 
     def tool_specs(self) -> list[ToolSpec]:
         return self.tools.tool_specs()
@@ -106,7 +109,17 @@ class RecordToolSession:
         self.trace: list[ToolTraceEntry] = []
 
     def call(self, call: ToolCall) -> ToolResult:
-        result = self._run(call)
+        tracer = self.gateway.tracer
+        with tracer.span(f"tool:{call.name}", "tool", {"arguments": dict(call.arguments)}) as span:
+            result = self._run(call)
+            span.end(
+                outputs={
+                    "result": result.result,
+                    "sensitivity": result.sensitivity,
+                    "cached": result.cached,
+                },
+                error=None if result.ok else f"{result.error}: {result.message}",
+            )
         self.trace.append(
             ToolTraceEntry(
                 tool=result.tool,

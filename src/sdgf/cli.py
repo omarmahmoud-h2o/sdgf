@@ -21,6 +21,10 @@ A run's options (seed, target size, plan seed, layers, per-cell attempt cap) are
 its directory as cli_options.json on first use, so resume, evaluate and release reuse
 them; passing a different value for a saved option is an error. Held-out paths are
 never saved (they stay run-time only), so pass --held-out again on each command.
+
+--trace langsmith sends a trace per candidate to LangSmith (LANGSMITH_API_KEY, optional
+LANGSMITH_ENDPOINT). Like --held-out it is run-time only: a run can be resumed with
+tracing on or off. A traced run records LangSmith as a data destination.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from sdgf.pipeline import DEFAULT_MAX_ROUNDS, Pipeline, RunResult
 from sdgf.spec.compile import CompiledSpec, compile_spec
 from sdgf.store.artefacts import ArtefactStore, new_run_id
 from sdgf.tools.registry import REGISTRY as TOOLS
+from sdgf.tracing import LANGSMITH, Tracer, make_tracer
 
 EXIT_OK = 0
 EXIT_INCOMPLETE = 1
@@ -173,7 +178,23 @@ def _pipeline(
         max_attempts_per_cell=options["max_attempts_per_cell"],
         held_out_paths=args.held_out or None,
         ignore_unused_overrides=True,
+        tracer=_tracer(args, compiled),
     )
+
+
+def _tracer(args: argparse.Namespace, compiled: CompiledSpec) -> Tracer | None:
+    kind = getattr(args, "trace", None)
+    if kind is None:
+        return None
+    project = args.trace_project or f"sdgf-{compiled.spec.task.name}"
+    tracer = make_tracer(kind, project=project, tags=args.trace_tags or ())
+    sink = tracer.sink or {}
+    print(
+        f"sdgf: tracing to {kind} ({sink.get('endpoint')}), project {project!r}, "
+        f"{sink.get('content', 'full')} content",
+        file=sys.stderr,
+    )
+    return tracer
 
 
 def _existing_run_id(args: argparse.Namespace, store: ArtefactStore, compiled: CompiledSpec) -> str:
@@ -438,6 +459,15 @@ def build_parser() -> argparse.ArgumentParser:
         )
         models(p)
 
+    def trace(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--trace",
+            choices=[LANGSMITH],
+            help="trace every candidate (model calls, tool calls, checks L1-L6) to this service",
+        )
+        p.add_argument("--trace-project", help="tracing project (default sdgf-<task name>)")
+        p.add_argument("--trace-tags", nargs="+", metavar="TAG", help="extra tags on every trace")
+
     def waive(p: argparse.ArgumentParser) -> None:
         p.add_argument(
             "--waive",
@@ -461,10 +491,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = task_command("run", "generate and validate a run (stages 0 to 3)")
     run_options(p)
+    trace(p)
     p.set_defaults(func=cmd_run)
 
     p = task_command("resume", "continue a run with its saved options (default: the latest)")
     run_options(p)
+    trace(p)
     p.set_defaults(func=cmd_resume)
 
     p = task_command("evaluate", "compute metrics and gate a run without writing (stages 4, 5)")
@@ -477,6 +509,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-rounds", type=_positive, default=DEFAULT_MAX_ROUNDS)
     p.add_argument("--version", help="release version (default derived from spec and run)")
     run_options(p)
+    trace(p)
     waive(p)
     p.set_defaults(func=cmd_release)
 

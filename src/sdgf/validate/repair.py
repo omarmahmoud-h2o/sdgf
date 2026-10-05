@@ -31,6 +31,7 @@ from sdgf.generate.generator import GenerationResult, Generator
 from sdgf.generate.prompts import Prompt
 from sdgf.store.artefacts import JsonlWriter
 from sdgf.store.provenance import ProvenanceBuilder
+from sdgf.tracing import NullTracer, Span, Tracer
 from sdgf.validate.base import Record, ValidationContext, ValidationIssue
 from sdgf.validate.cascade import Cascade, CascadeResult
 from sdgf.validate.l3_governance import TOOL_TRACE_KEY
@@ -122,6 +123,7 @@ class RepairOutcome:
     result: CascadeResult | None = None  # the last cascade run, None if never validated
     drop: Drop | None = None
     history: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)  # (layer, codes)
+    feedback: str = field(default="", repr=False)  # the repair text for the next try
 
     @property
     def accepted(self) -> bool:
@@ -142,9 +144,11 @@ class RepairLoop:
         *,
         repair_tries: int | None = None,
         drop_log: DropLog | None = None,
+        tracer: Tracer | None = None,
     ):
         self.generator = generator
         self.cascade = cascade
+        self.tracer: Tracer = tracer if tracer is not None else NullTracer()
         tries = repair_tries
         if tries is None:
             tries = generator.compiled.spec.validation.repair_tries
@@ -167,40 +171,94 @@ class RepairLoop:
         feedback = ""
         session = self.generator.session()
         for attempt in range(self.repair_tries + 1):
-            if attempt and provenance is not None:
-                provenance.start_repair()
-            outcome.attempts = attempt + 1
-            traced = len(session.trace) if session is not None else 0
-            gen = self.generator.complete(cell_id, recipe, prompt, extra=feedback, session=session)
-            if session is not None and provenance is not None:
-                for entry in session.trace[traced:]:
-                    provenance.add_tool_call(entry)
-            if not gen.ok:
-                issue = _generation_issue(gen)
-                outcome.history.append((GENERATE_STAGE, (issue.code,)))
-                if attempt == self.repair_tries:
-                    return self._drop(outcome, GENERATE_STAGE, (issue,), hard=False)
-                feedback = repair_feedback([issue])
-                continue
-
-            extra = dict(extra_context or {})
-            if session is not None:
-                extra[TOOL_TRACE_KEY] = session.trace_dicts()
-            context = ValidationContext(
-                cell_id=cell_id, recipe=dict(recipe), attempt=attempt, extra=extra
-            )
-            result = self.cascade.run(gen.record, context, provenance)
-            outcome.result = result
-            if result.passed:
-                outcome.record = gen.record
-                return outcome
-            layer = result.failed_layer
-            assert layer is not None
-            outcome.history.append((layer, tuple(e.code for e in result.errors)))
-            if result.hard or attempt == self.repair_tries:
-                return self._drop(outcome, layer, result.errors, hard=result.hard)
-            feedback = repair_feedback(result.errors)
+            inputs = {"attempt": attempt, "repair_feedback": feedback or None}
+            with self.tracer.span(f"attempt {attempt}", "chain", inputs) as span:
+                done = self._attempt(
+                    attempt,
+                    outcome,
+                    cell_id,
+                    recipe,
+                    prompt,
+                    provenance,
+                    extra_context,
+                    session,
+                    feedback,
+                    span,
+                )
+            if done is not None:
+                return done
+            feedback = outcome.feedback
         raise AssertionError("unreachable")  # pragma: no cover
+
+    def _attempt(
+        self,
+        attempt: int,
+        outcome: RepairOutcome,
+        cell_id: str | None,
+        recipe: Mapping[str, Any],
+        prompt: Prompt,
+        provenance: ProvenanceBuilder | None,
+        extra_context: Mapping[str, Any] | None,
+        session: Any,
+        feedback: str,
+        span: Span,
+    ) -> RepairOutcome | None:
+        """One try: generate, then the cascade. Returns the finished outcome, or None to
+        repair with outcome.feedback."""
+        if attempt and provenance is not None:
+            provenance.start_repair()
+        outcome.attempts = attempt + 1
+        traced = len(session.trace) if session is not None else 0
+        with self.tracer.span("generate", "chain", {"attempt": attempt}) as gen_span:
+            gen = self.generator.complete(cell_id, recipe, prompt, extra=feedback, session=session)
+            gen_span.end(
+                outputs={"ok": gen.ok, "record": gen.record, "tool_rounds": gen.tool_rounds},
+                error=None if gen.ok else f"{gen.error}: {gen.detail}",
+            )
+        if session is not None and provenance is not None:
+            for entry in session.trace[traced:]:
+                provenance.add_tool_call(entry)
+        if not gen.ok:
+            issue = _generation_issue(gen)
+            outcome.history.append((GENERATE_STAGE, (issue.code,)))
+            span.end(
+                outputs={
+                    "outcome": "fail_repairable",
+                    "layer": GENERATE_STAGE,
+                    "codes": [issue.code],
+                }
+            )
+            if attempt == self.repair_tries:
+                return self._drop(outcome, GENERATE_STAGE, (issue,), hard=False)
+            outcome.feedback = repair_feedback([issue])
+            return None
+
+        extra = dict(extra_context or {})
+        if session is not None:
+            extra[TOOL_TRACE_KEY] = session.trace_dicts()
+        context = ValidationContext(
+            cell_id=cell_id, recipe=dict(recipe), attempt=attempt, extra=extra
+        )
+        result = self.cascade.run(gen.record, context, provenance)
+        outcome.result = result
+        span.end(
+            outputs={
+                "outcome": result.outcome,
+                "layer": result.failed_layer,
+                "codes": [e.code for e in result.errors],
+                "layers_run": list(result.layers_run),
+            }
+        )
+        if result.passed:
+            outcome.record = gen.record
+            return outcome
+        layer = result.failed_layer
+        assert layer is not None
+        outcome.history.append((layer, tuple(e.code for e in result.errors)))
+        if result.hard or attempt == self.repair_tries:
+            return self._drop(outcome, layer, result.errors, hard=result.hard)
+        outcome.feedback = repair_feedback(result.errors)
+        return None
 
     def _drop(
         self,
