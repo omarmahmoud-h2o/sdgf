@@ -166,6 +166,16 @@ def test_label_rule_error_on_missing_fact():
     assert verdict.errors[0].details["exception"] == "KeyError"
 
 
+def test_label_rule_attribute_error_on_a_bad_record_is_sent_back_not_raised():
+    # e.g. a hook calling .lower() on a fact the model left as null
+    def reads_a_missing_attribute(rec):
+        return rec.get("tier").lower() == "personal"
+
+    verdict = RulesLayer(label_rule=reads_a_missing_attribute).check({"label": True}, CTX)
+    assert verdict.repairable and codes(verdict) == ["label_rule_error"]
+    assert verdict.errors[0].details["exception"] == "AttributeError"
+
+
 # ── extra_validators ───────────────────────────────────────────
 
 

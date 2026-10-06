@@ -16,7 +16,7 @@ each code name is given once in backticks. For setting up a new dataset, see
 |---|---|---|
 | 0 Intake | Load the three task spec files, check the YAML against the schema, check hook signatures, scan seeds for personal data and toxicity, confirm every listed tool exists and every release target is set. All problems are reported together. The output is the compiled spec and its spec version. | `spec/` |
 | 1 Plan | Turn each axis into values, cross them into cells, let `sampler_constraints` fill in or reject each cell, and give each cell a quota. The plan is saved per spec version and reused. If `hitl.approve_coverage_plan` is on, the run stops (exit 3) until someone runs `sdgf plan --approve`. | `coverage/` |
-| 2 Generate | The scheduler picks the cell furthest below its quota. Code builds the fixed facts for one record, the prompt is rendered, and the model writes a candidate. | `generate/` |
+| 2 Generate | The scheduler picks the cell furthest below its quota. Code builds the fixed facts for one record, the prompt is rendered, and the model writes a candidate. A cell gets at most quota × (`repair_tries` + 1) × 3 candidates (or `--max-attempts-per-cell`); one that still hasn't filled stops the run as `stalled`, named in `stalled_cells`. Rate limits, 5xx errors and dropped connections from a model are retried with backoff (1 s, 2 s, 4 s); a model still failing after that stops the run with a named error, and `resume` continues it. | `generate/` |
 | 3 Check | The candidate goes through L1 to L6. It is kept, sent back, or dropped. | `validate/` |
 | 4 Measure | Agreement rate, coverage, balance, diversity, copying, safety, cost and yield are computed over the whole run. Anything not measured is recorded as missing, never as 0. | `evaluation/metrics.py` |
 | 5 Release check | Each measurement is compared with its target in `task.yaml`. If all are met, the release directory is written. If not, a shortfall report is written and only the short cells are generated again, up to `--max-rounds` times. | `evaluation/gate.py` |
@@ -181,6 +181,7 @@ untrusted until a calibration passes.
 | unsure (confidence below `escalation.low_confidence`) and `hitl.review_flagged` on | dropped from the automatic path and queued for a person (`sent_to_review`) |
 | unsure, review off | passes L5, flagged for extra votes |
 | output unusable | to review if it's on, else dropped (`judge_error`): a broken judge isn't fixed by rewriting the record |
+| the reason writer fails | the verdict stands without a reason; the error is kept in `details.reason_error` |
 
 A candidate is also flagged for extra votes if its cell is marked hard
 (`escalation.on_hard_cells`) or contestable (`on_contestable`), or if
@@ -212,12 +213,15 @@ a temperature-0 judge would cast L5's verdict K times. The votes come from
 otherwise from `models.judge`. With L6 on and `consistency_k` above 1, stage 0 rejects a
 temperature list that is all 0, since the K votes would be identical.
 
-A vote that can't be read doesn't count either way. If none can be read, the judge is
-broken, not the record: dropped (`consistency_no_votes`).
+A vote that can't be read, or whose model call failed, doesn't count either way (the
+ballot keeps the `error`). If none can be read, the judge is broken, not the record:
+dropped (`consistency_no_votes`).
 
 Each vote is kept with its stage, model and temperature, in L6's `ballots` detail and in
 the record's provenance (`layer_results[].ballots`), so vote agreement can be analysed
-after a run.
+after a run. When the votes were identical on every escalated record (at least 3), the
+run logs a warning and `summary.json` records it under `l6_votes`: the voting model
+probably ignores temperature, so its K votes repeat one judgement.
 
 | | FAG | CFA |
 |---|---|---|

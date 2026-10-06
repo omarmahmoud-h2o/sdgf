@@ -107,6 +107,16 @@ A run's options (`--seed`, `--target-size`, `--plan-seed`, `--layers`,
 `resume`, `evaluate` and `release`. `--held-out PATH` enables the L4 held-out overlap
 check. It is never saved and never reaches a model, so pass it again on each command.
 
+Without `--max-attempts-per-cell`, a cell gets at most quota × (`repair_tries` + 1) × 3
+candidates, then the run stops as `stalled` and `summary.json` names it in
+`stalled_cells`. Transient model errors (429, 5xx, dropped connections) are retried with
+backoff; a model still failing after 3 retries stops the run with a named error.
+
+When the generator is a `provider_api` model and the prompt shows few-shot seeds, the run
+warns that seed text leaves word for word, and `spec.json` and the release's
+`governance_report.json` list it under `seeds_sent_to`. Stage 0 only scans seeds for PII
+and toxicity patterns, so obfuscate real seeds before they reach an external model.
+
 From Python:
 
 ```python

@@ -19,11 +19,11 @@ def test_a_run_that_absorbs_its_faults_is_completed_and_ok(tmp_path):
 
 
 def test_a_run_that_raises_is_crashed_at_the_sdgf_line_that_raised(tmp_path):
-    r = run_scenario("11a", FAG, WORLD, str(tmp_path))
+    # scenario 4: the generator's backend fails on call 3, which stops the run
+    r = run_scenario("4", FAG, WORLD, str(tmp_path))
     assert r["result"] == "CRASHED"
-    assert r["error_type"] == "AttributeError"
-    assert r["where"].startswith("l2_rules.py:")
-    assert not BY_KEY["11a"].ok(r)
+    assert r["error_type"] == "ModelBackendError"
+    assert r["where"].startswith("generator.py:")
 
 
 def test_a_run_still_going_at_the_timeout_is_hung():

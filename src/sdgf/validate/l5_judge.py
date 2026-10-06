@@ -205,10 +205,17 @@ class JudgeLayer(Layer):
     def _escalate(self, record: Record, context: ValidationContext, low: bool) -> bool:
         return escalates(self.escalation, record, context, low)
 
-    def _reason(self, view: Record, result: JudgeResult, flagged: bool) -> str | None:
+    def _reason(
+        self, view: Record, result: JudgeResult, flagged: bool
+    ) -> tuple[str | None, str | None]:
+        """(reason, error). A reason writer that fails doesn't cost the verdict: the
+        verdict stands without a reason and the error is kept in the details."""
         if self.reasoner is None or not self.schema.needs_reason(flagged):
-            return None
-        return self.reasoner.explain(view, result)
+            return None, None
+        try:
+            return self.reasoner.explain(view, result), None
+        except Exception as e:  # the reason is commentary; the judge's verdict stands
+            return None, f"{type(e).__name__}: {e}"
 
     def _send_to_review(
         self,
@@ -246,7 +253,7 @@ class JudgeLayer(Layer):
 
         agrees = self.agrees(result.verdict, label)
         low = result.verdict_confidence < self.escalation.low_confidence
-        reason = self._reason(view, result, flagged=low or not agrees)
+        reason, reason_error = self._reason(view, result, flagged=low or not agrees)
         details: dict[str, Any] = {
             "judge": result.to_dict(),
             "agrees": agrees,
@@ -256,6 +263,8 @@ class JudgeLayer(Layer):
         }
         if reason is not None:
             details["reason"] = reason
+        if reason_error is not None:
+            details["reason_error"] = reason_error
         conf = round(result.verdict_confidence, 3)
 
         if low and self.review is not None:

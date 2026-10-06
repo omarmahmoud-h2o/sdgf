@@ -4,6 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from sdgf.models.base import ModelBackendError
+from sdgf.store.provenance import ProvenanceBuilder
+
 from sdgf.judge.interface import Judge, JudgeParseError, JudgeResult, compile_rubric
 from sdgf.judge.llm_judge import LLMJudge
 from sdgf.models.mock import MockBackend
@@ -155,6 +158,40 @@ def test_unparseable_votes_are_abstentions_not_in_denominator():
     assert v.details["votes"] == ["yes", None, None, "yes", None]
 
 
+class FlakyVoteJudge(VoteJudge):
+    """Like VoteJudge, but "down" raises a backend error (the voting model failed)."""
+
+    def judge(self, record):
+        if self.verdicts[0] == "down":
+            self.verdicts.pop(0)
+            raise ModelBackendError("voting model API down")
+        return super().judge(record)
+
+
+def test_a_vote_whose_model_fails_is_an_abstention_not_a_crash():
+    v = layer(FlakyVoteJudge(["yes", "down", "yes", "no", "yes"])).check(RECORD, judged())
+    assert v.passed
+    assert v.details["votes"] == ["yes", None, "yes", "no", "yes"]
+    assert v.details["cast"] == 4 and v.details["abstained"] == 1
+    assert v.details["ballots"][1]["error"] == "ModelBackendError: voting model API down"
+
+
+def test_a_failed_vote_reaches_provenance_with_its_error():
+    v = layer(FlakyVoteJudge(["yes", "down", "yes", "no", "yes"])).check(RECORD, judged())
+    prov = ProvenanceBuilder(
+        "sha256:" + "0" * 64,
+        "c1",
+        0,
+        [{"stage": "generator", "backend": "mock", "model": "m", "hosting": "local"}],
+    )
+    prov.set_prompt("prompt")
+    prov.add_layer_result("L6", v.outcome, v.messages(), ballots=v.details["ballots"])
+    ballots = prov.build().layer_results[0].ballots
+    assert ballots[1].vote is None
+    assert ballots[1].error == "ModelBackendError: voting model API down"
+    assert ballots[0].error is None
+
+
 def test_abstentions_do_not_rescue_a_disagreement():
     v = layer(VoteJudge(["no", None, "yes", "no", None])).check(RECORD, judged())
     assert v.repairable and v.errors[0].details["cast"] == 3
@@ -260,6 +297,25 @@ def test_answer_emergent_unreadable_answers_abstain():
     v = lay.check(record, judged())
     assert v.passed and v.details["answer"] == "B"
     assert v.details["cast"] == 2 and v.details["abstained"] == 3
+
+
+def test_answer_emergent_vote_whose_model_fails_is_an_abstention():
+    def answerer(view, i):
+        if i == 1:
+            raise ModelBackendError("answering model API down")
+        return "Answer: B"
+
+    lay = ConsistencyLayer(
+        mode="answer_emergent",
+        k=3,
+        fields=("question",),
+        answerer=answerer,
+        extractor=letter,
+        answer_field="answer",
+    )
+    record = {"question": "Q?", "response": "Answer: B", "answer": "B"}
+    v = lay.check(record, judged())
+    assert v.passed and v.details["cast"] == 2 and v.details["abstained"] == 1
 
 
 def test_answer_emergent_without_majority_is_repairable():

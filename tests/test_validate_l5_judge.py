@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from sdgf.models.base import ModelBackendError
+
 from sdgf.judge.interface import Judge, JudgeError, JudgeParseError, JudgeResult, compile_rubric
 from sdgf.judge.llm_judge import RECORD_HEADER, LLMJudge
 from sdgf.models.mock import MockBackend
@@ -208,6 +210,19 @@ def test_reason_comes_from_the_fallback_judge():
     judge, lay = with_reasons("always", writes=False, fallback=fallback)
     assert lay.check(RECORD, CTX).details["reason"] == "fallback says so"
     assert fallback.seen == [] and len(fallback.explained) == 1
+
+
+class BrokenReasoner(FakeJudge):
+    def explain(self, record, result):
+        raise ModelBackendError("reason writer API down")
+
+
+def test_a_failing_reason_writer_keeps_the_verdict_and_records_the_error():
+    judge, lay = with_reasons("flagged", verdict="no", writes=False, fallback=BrokenReasoner())
+    v = lay.check(RECORD, CTX)
+    assert v.repairable and v.codes == ("judge_disagrees",)
+    assert "reason" not in v.details
+    assert v.details["reason_error"] == "ModelBackendError: reason writer API down"
 
 
 def test_reasons_need_a_judge_that_writes_them():

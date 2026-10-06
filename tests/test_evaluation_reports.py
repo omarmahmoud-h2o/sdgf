@@ -120,6 +120,7 @@ def test_governance_report_lists_external_endpoints(fag, release):  # noqa: F811
     }
     assert gov["external_endpoints"] == [stages["judge"]]
     assert gov["held_out_check"] is False
+    assert gov["seeds_sent_to"] == []  # the generator is local, so no seed text left
     assert "pii_rules" in gov["profile"]
 
 

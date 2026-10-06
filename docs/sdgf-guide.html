@@ -521,7 +521,7 @@ each code name is given once in backticks. For setting up a new dataset, see
 </tr>
 <tr>
 <td>2 Generate</td>
-<td>The scheduler picks the cell furthest below its quota. Code builds the fixed facts for one record, the prompt is rendered, and the model writes a candidate.</td>
+<td>The scheduler picks the cell furthest below its quota. Code builds the fixed facts for one record, the prompt is rendered, and the model writes a candidate. A cell gets at most quota × (<code>repair_tries</code> + 1) × 3 candidates (or <code>--max-attempts-per-cell</code>); one that still hasn't filled stops the run as <code>stalled</code>, named in <code>stalled_cells</code>. Rate limits, 5xx errors and dropped connections from a model are retried with backoff (1 s, 2 s, 4 s); a model still failing after that stops the run with a named error, and <code>resume</code> continues it.</td>
 <td><code>generate/</code></td>
 </tr>
 <tr>
@@ -693,6 +693,10 @@ untrusted until a calibration passes.</p>
 <td>output unusable</td>
 <td>to review if it's on, else dropped (<code>judge_error</code>): a broken judge isn't fixed by rewriting the record</td>
 </tr>
+<tr>
+<td>the reason writer fails</td>
+<td>the verdict stands without a reason; the error is kept in <code>details.reason_error</code></td>
+</tr>
 </tbody>
 </table></div>
 <p>A candidate is also flagged for extra votes if its cell is marked hard
@@ -730,11 +734,14 @@ a temperature-0 judge would cast L5's verdict K times. The votes come from
 <code>models.consistency_judge</code> if set, so they can come from a different model than L5;
 otherwise from <code>models.judge</code>. With L6 on and <code>consistency_k</code> above 1, stage 0 rejects a
 temperature list that is all 0, since the K votes would be identical.</p>
-<p>A vote that can't be read doesn't count either way. If none can be read, the judge is
-broken, not the record: dropped (<code>consistency_no_votes</code>).</p>
+<p>A vote that can't be read, or whose model call failed, doesn't count either way (the
+ballot keeps the <code>error</code>). If none can be read, the judge is broken, not the record:
+dropped (<code>consistency_no_votes</code>).</p>
 <p>Each vote is kept with its stage, model and temperature, in L6's <code>ballots</code> detail and in
 the record's provenance (<code>layer_results[].ballots</code>), so vote agreement can be analysed
-after a run.</p>
+after a run. When the votes were identical on every escalated record (at least 3), the
+run logs a warning and <code>summary.json</code> records it under <code>l6_votes</code>: the voting model
+probably ignores temperature, so its K votes repeat one judgement.</p>
 <div class="compare" data-show="fag"><div class="seg" role="group" aria-label="Example"><button type="button" data-show="fag" aria-pressed="true">FAG</button><button type="button" data-show="cfa" aria-pressed="false">CFA</button><button type="button" data-show="both" aria-pressed="false">Side by side</button></div><div class="cmp-head"><div></div><div data-side="fag">FAG</div><div data-side="cfa">CFA</div></div><div class="cmp-row"><div class="cmp-label">Flagged because</div><div class="cmp-cell" data-side="fag">The judge agreed but with confidence 0.6, below 0.7.</div><div class="cmp-cell" data-side="cfa">Every CFA record is flagged (<code>escalation.always: true</code>).</div></div><div class="cmp-row"><div class="cmp-label">Fails when</div><div class="cmp-cell" data-side="fag">5 votes: 2 breach, 3 no breach.</div><div class="cmp-cell" data-side="cfa">5 answers: C, C, B, C, unreadable. The majority is C; the record says B.</div></div><div class="cmp-row"><div class="cmp-label">Issue code</div><div class="cmp-cell" data-side="fag"><code>consistency_disagrees</code></div><div class="cmp-cell" data-side="cfa"><code>consistency_answer_mismatch</code></div></div><div class="cmp-row"><div class="cmp-label">Result</div><div class="cmp-cell" data-side="fag">sent back</div><div class="cmp-cell" data-side="cfa">sent back</div></div></div>
 
 <p>Cost: up to K calls (<code>consistency_k</code>, 5 for both tasks), only for flagged candidates.

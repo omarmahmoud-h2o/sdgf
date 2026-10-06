@@ -104,6 +104,7 @@ from sdgf.evaluation.gate import GateResult, evaluate_gate
 from sdgf.evaluation.metrics import MetricsReport, metrics_for_run
 from sdgf.evaluation.reports import write_release, write_shortfall
 from sdgf.generate.generator import Generator
+from sdgf.generate.prompts import select_few_shot
 from sdgf.hitl.queue import require_plan_approval
 from sdgf.judge.calibration import CalibrationResult, CalibrationStore
 from sdgf.judge.interface import Judge
@@ -134,6 +135,8 @@ from sdgf.validate.l6_consistency import (
     ConsistencyLayer,
     vote_stage,
 )
+from sdgf.judge.jev import JEV_BACKEND
+from sdgf.models.retry import DEFAULT_BACKOFF, RetryingBackend
 from sdgf.tracing import (
     NULL_REF,
     TRACE_SINKS_STAGE,
@@ -155,6 +158,8 @@ DROPS_STREAM = "drops"
 REVIEW_STREAM = "review"
 ROUNDS_STAGE = "rounds"
 DEFAULT_MAX_ROUNDS = 3
+DEFAULT_TRIES_PER_ATTEMPT = 3  # default stop rule: quota x (repair_tries + 1) x this
+MIN_VOTED_FOR_WARNING = 3  # escalated records needed before identical L6 votes are flagged
 
 
 class PipelineError(ValueError):
@@ -288,6 +293,7 @@ class Pipeline:
         tool_registry: ToolRegistry | None = None,
         ignore_unused_overrides: bool = False,
         tracer: Tracer | None = None,
+        retry_backoff: float = DEFAULT_BACKOFF,
     ):
         # Stage 0: spec schema and hook signatures are checked on load; the task type
         # and its generation mode are resolved here, before any model is built.
@@ -306,6 +312,7 @@ class Pipeline:
         self.held_out_paths = list(held_out_paths) if held_out_paths is not None else None
         # Tracing is run-time only (never in the spec), so toggling it keeps spec_version.
         self.tracer: Tracer = tracer if tracer is not None else NullTracer()
+        self.retry_backoff = retry_backoff
 
         configured = self.compiled.spec.validation.layers
         if layers is None:
@@ -407,9 +414,38 @@ class Pipeline:
         assert overlap is None or isinstance(overlap, OverlapLayer)
         self.overlap: OverlapLayer | None = overlap
         self.cascade = Cascade.from_config(self.layers, implementations, tracer=self.tracer)
+        self.seeds_sent_to = self._seed_exposure()
+        for e in self.seeds_sent_to:
+            log.warning(
+                "%d few-shot seed(s) from seeds.jsonl are sent word for word to external "
+                "model %s:%s. Stage 0 only scans seeds for PII and toxicity patterns, so "
+                "obfuscate them first (FRAMEWORK_DESIGN.md D2) or use a local generator; "
+                "ignore this if the seeds are fictional",
+                e["seeds"],
+                e["backend"],
+                e["model"],
+            )
+
+    def _seed_exposure(self) -> list[dict[str, Any]]:
+        """The external models that receive seed text: the generator, when the prompt
+        shows few-shot seeds and the generator is a provider API (D12)."""
+        spec = self.compiled.spec
+        if "few_shot" not in spec.seeds.uses:
+            return []
+        shown = len(select_few_shot(self.compiled.seeds, spec.seeds.few_shot_count))
+        backend = self.models.backend("generator")
+        if not shown or backend.hosting != "provider_api":
+            return []
+        return [
+            {"stage": "generator", "backend": backend.name, "model": backend.model, "seeds": shown}
+        ]
 
     def _traced(self, stage: str) -> ModelBackend:
+        """A stage's backend, retrying transient errors (Jev retries on its own) and
+        traced when tracing is on; metering and concurrency caps wrap this."""
         backend = self.models.backend(stage)
+        if backend.name != JEV_BACKEND:
+            backend = RetryingBackend(backend, backoff=self.retry_backoff)
         return TracedBackend(backend, stage, self.tracer) if self.tracer.enabled else backend
 
     def _plan_cached(self) -> bool:
@@ -515,6 +551,7 @@ class Pipeline:
             "judge_trusted": self.trusted,
             "workers": self.workers,
             "models": self.models.endpoints(),
+            "seeds_sent_to": self.seeds_sent_to,
         }
 
     def _record_trace_sink(self, run: RunDir) -> None:
@@ -579,8 +616,14 @@ class Pipeline:
             if unknown:
                 raise PipelineError(f"cells {unknown} are not in run {run.run_id!r}")
         scheduled = [c for c in cells if only is None or c.id in only]
+        # Default stop rule: a cell gets quota x (repair_tries + 1) x 3 candidates, so one
+        # that never fills stalls by name instead of spending the whole budget.
+        repair_tries = self.compiled.spec.validation.repair_tries
         scheduler = Scheduler(
-            scheduled, self.compiled.spec.budget, max_attempts_per_cell=self.max_attempts_per_cell
+            scheduled,
+            self.compiled.spec.budget,
+            max_attempts_per_cell=self.max_attempts_per_cell,
+            attempts_per_quota=(repair_tries + 1) * DEFAULT_TRIES_PER_ATTEMPT,
         )
         if prior_usage is not None:
             scheduler.restore_usage(
@@ -647,6 +690,9 @@ class Pipeline:
         snapshot = scheduler.snapshot()
         snapshot["usage_by_stage"] = ledger.to_dict()
         snapshot["drops"] = {"by_layer": drops.by_layer(), "by_code": drops.by_code()}
+        snapshot["l6_votes"] = l6_vote_spread(accepted)
+        if snapshot["l6_votes"]["warning"]:
+            log.warning(snapshot["l6_votes"]["warning"])
         snapshot["skipped_layers"] = list(self.skipped_layers)
         snapshot["only"] = None if only is None else [c.id for c in scheduled]
         run.write_stage("summary", snapshot)
@@ -855,6 +901,28 @@ class Pipeline:
             # A JSON round trip makes the returned record identical to the stored line.
             slot.record = json.loads(json.dumps(attach(record, provenance)))
             return slot
+
+
+def l6_vote_spread(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """How often L6's votes all agreed. Identical votes on every escalated record mean the
+    voting model gave one judgement K times (e.g. it ignores temperature), so the votes
+    aren't independent checks."""
+    voted = identical = 0
+    for r in records:
+        for result in r[PROVENANCE_KEY].get("layer_results", ()):
+            votes = [json.dumps(b.get("vote")) for b in result.get("ballots", ())]
+            if result.get("layer") == "L6" and len(votes) > 1:
+                voted += 1
+                identical += len(set(votes)) == 1
+    warning = None
+    if voted >= MIN_VOTED_FOR_WARNING and identical == voted:
+        warning = (
+            f"L6 votes were identical on all {voted} escalated records: the voting model "
+            "may ignore temperature (e.g. Claude Opus 5.5), so its votes repeat one "
+            "judgement. Set models.consistency_judge to a model that samples, or "
+            "validation.consistency_k: 1"
+        )
+    return {"voted": voted, "identical": identical, "warning": warning}
 
 
 def trace_feedback(result: Any) -> dict[str, Any]:

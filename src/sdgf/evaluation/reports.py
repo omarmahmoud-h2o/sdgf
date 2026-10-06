@@ -115,6 +115,7 @@ def governance_report(
     *,
     held_out_check: bool | None = None,
     trace_sinks: Sequence[Mapping[str, Any]] = (),
+    seeds_sent_to: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     tools: dict[str, dict[str, Any]] = {}
     for r in records:
@@ -137,6 +138,8 @@ def governance_report(
         "external_endpoints": [dict(e) for e in endpoints if e["hosting"] == "provider_api"],
         # services that received run data for tracing (sdgf run --trace), not models
         "trace_sinks": [dict(t) for t in trace_sinks],
+        # external models that were shown seed text as few-shot examples
+        "seeds_sent_to": [dict(s) for s in seeds_sent_to],
         "tools": {
             name: {"calls": t["calls"], "sensitivity": sorted(t["sensitivity"])}
             for name, t in sorted(tools.items())
@@ -211,6 +214,11 @@ def dataset_card(
         f"External endpoints that received data: {len(external)}"
         + (" — " + ", ".join(f"{e['backend']}:{e['model']}" for e in external) if external else ""),
     ]
+    for e in governance.get("seeds_sent_to", ()):
+        out.append(
+            f"Seed text sent to an external model: {e['seeds']} few-shot seed(s) to "
+            f"{e['backend']}:{e['model']}."
+        )
     for t in governance.get("trace_sinks", ()):
         out.append(
             f"Traced to {t['sink']} ({t['endpoint']}, project `{t['project']}`, "
@@ -318,6 +326,7 @@ def write_release(
             records,
             held_out_check=intake.get("held_out_check"),
             trace_sinks=run.read_stage("trace_sinks") if run.has_stage("trace_sinks") else (),
+            seeds_sent_to=intake.get("seeds_sent_to", ()),
         )
         with (
             (tmp / DATASET).open("w", encoding="utf-8") as data,

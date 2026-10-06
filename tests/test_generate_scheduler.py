@@ -139,6 +139,20 @@ def test_max_attempts_stalls_an_impossible_cell():
     assert s.short_cells() == {"bad": 2}
 
 
+def test_attempts_per_quota_stalls_an_impossible_cell_in_proportion_to_its_quota():
+    # quota 2 x 3 attempts per quota slot = 6 tries, then the cell stalls by name
+    s = Scheduler([Cell("bad", {}, 2), Cell("ok", {}, 2)], attempts_per_quota=3)
+    handed = run(s, lambda c, n: c.id == "ok")
+    assert handed.count("bad") == 6
+    assert s.stalled_cells() == ["bad"]
+    assert s.stop_reason == "stalled"
+
+
+def test_an_explicit_attempt_cap_wins_over_attempts_per_quota():
+    s = Scheduler([Cell("bad", {}, 2)], max_attempts_per_cell=4, attempts_per_quota=3)
+    assert run(s, lambda c, n: False).count("bad") == 4
+
+
 def test_settle_errors():
     s = Scheduler(CELLS)
     with pytest.raises(SchedulerError, match="no reservation"):

@@ -78,10 +78,11 @@ class ToolTraceEntry:
 class Ballot:
     """One vote a layer took, and where it came from; None where the voter didn't say."""
 
-    vote: Any = None  # None is an abstention (an unparseable vote)
+    vote: Any = None  # None is an abstention (an unparseable vote, or a failed voter)
     stage: str | None = None
     model: str | None = None
     temperature: float | None = None
+    error: str | None = None  # why the voter's model failed, when it did
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,10 @@ class Provenance:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["format"] = PROVENANCE_FORMAT
+        for result in d["layer_results"]:  # a ballot carries "error" only when one happened
+            for b in result["ballots"]:
+                if b.get("error") is None:
+                    b.pop("error", None)
         return d
 
     @classmethod

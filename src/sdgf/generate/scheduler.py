@@ -89,6 +89,7 @@ class Scheduler:
         budget: BudgetSection | None = None,
         *,
         max_attempts_per_cell: int | None = None,
+        attempts_per_quota: int | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self._order: list[str] = []
@@ -102,6 +103,11 @@ class Scheduler:
             raise SchedulerError("scheduler needs at least one cell")
         if max_attempts_per_cell is not None and max_attempts_per_cell < 1:
             raise SchedulerError("max_attempts_per_cell must be >= 1")
+        if attempts_per_quota is not None and attempts_per_quota < 1:
+            raise SchedulerError("attempts_per_quota must be >= 1")
+        # A cell's attempt cap: max_attempts_per_cell if given, else attempts_per_quota x
+        # its quota, else none (only the budget stops a cell that never fills).
+        self.attempts_per_quota = attempts_per_quota
         self.budget = budget or BudgetSection()
         self.max_attempts_per_cell = max_attempts_per_cell
         self.usage = Usage()
@@ -161,6 +167,8 @@ class Scheduler:
 
     def _out_of_attempts(self, st: CellState) -> bool:
         cap = self.max_attempts_per_cell
+        if cap is None and self.attempts_per_quota is not None:
+            cap = self.attempts_per_quota * st.cell.quota
         return cap is not None and st.attempts >= cap
 
     def _settle(self, cell_id: str) -> CellState:
@@ -248,6 +256,7 @@ class Scheduler:
     def snapshot(self) -> dict[str, Any]:
         return {
             "stop_reason": self.stop_reason,
+            "stalled_cells": self.stalled_cells(),
             "usage": {
                 "candidates": self.usage.candidates,
                 "tokens": self.usage.tokens,

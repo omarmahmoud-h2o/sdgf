@@ -395,3 +395,82 @@ def test_held_out_paths_need_l4(fag, tmp_path):
             layers=["L1", "L2"],
             held_out_paths=[tmp_path / "x.jsonl"],
         )
+
+
+def test_a_run_whose_cells_never_fill_stalls_after_a_bounded_number_of_tries(fag, tmp_path):
+    # FAG: repair_tries 2, so the default cap is quota x (2 + 1) x 3 = 9 tries per quota slot
+    garbage = MockBackend(lambda call: "not json at all")
+    _, result = run(fag, tmp_path, garbage, target_size=8)
+    assert result.stop_reason == "stalled"
+    assert len(result.drops) == 8 * 9
+    with_quota = sorted(c["id"] for c in result.run.read_stage("cells") if c["quota"])
+    assert sorted(result.snapshot["stalled_cells"]) == with_quota
+
+
+def test_an_explicit_attempt_cap_overrides_the_default_stop_rule(fag, tmp_path):
+    garbage = MockBackend(lambda call: "not json at all")
+    _, result = run(fag, tmp_path, garbage, target_size=8, max_attempts_per_cell=1)
+    assert result.stop_reason == "stalled"
+    with_quota = [c for c in result.run.read_stage("cells") if c["quota"]]
+    assert len(result.drops) == len(with_quota)  # one try per cell
+
+
+def test_a_run_survives_a_transient_rate_limit_from_its_model(fag, tmp_path):
+    import urllib.error
+
+    healthy = valid_backend()
+    seen = []
+
+    def once_rate_limited(call):
+        seen.append(call)
+        if len(seen) == 3:
+            raise urllib.error.HTTPError("https://api.example.invalid", 429, "x", None, None)
+        return healthy.call(call.prompt, call.max_tokens, call.temperature).text
+
+    _, result = run(fag, tmp_path, MockBackend(once_rate_limited), retry_backoff=0.0)
+    assert result.complete
+
+
+# ── run warnings ─────────────────────────────────────────────────
+
+
+def judged_world_run(fag, tmp_path, judge_wrapper=None, generator_hosting=None):
+    from test_m4_checkpoint import World
+
+    world = World()
+    backends = world.backends()
+    if judge_wrapper is not None:
+        backends["judge"] = judge_wrapper(backends["judge"])
+    if generator_hosting is not None:
+        backends["generator"] = MockBackend(world.generate, hosting=generator_hosting)
+    pipe = Pipeline(fag, tmp_path / "store", model_overrides=backends, target_size=TARGET)
+    return pipe.run("w")
+
+
+def test_identical_l6_votes_on_every_escalated_record_are_flagged(fag, tmp_path, caplog):
+    # World's judge answers the same at every temperature, as a model that ignores it would
+    result = judged_world_run(fag, tmp_path)
+    votes = result.snapshot["l6_votes"]
+    assert votes["voted"] >= 3 and votes["identical"] == votes["voted"]
+    assert "L6 votes were identical" in votes["warning"]
+    assert "L6 votes were identical" in caplog.text
+
+
+def test_l6_votes_that_differ_are_not_flagged(fag, tmp_path):
+    from sdgf.stress import FlipAtTemperature
+
+    result = judged_world_run(fag, tmp_path, judge_wrapper=FlipAtTemperature)
+    assert result.snapshot["l6_votes"]["warning"] is None
+
+
+def test_seeds_shown_to_an_external_generator_are_warned_about_and_recorded(fag, tmp_path, caplog):
+    result = judged_world_run(fag, tmp_path, generator_hosting="provider_api")
+    assert "few-shot seed" in caplog.text
+    sent = result.run.read_stage("spec")["seeds_sent_to"]
+    assert sent == [{"stage": "generator", "backend": "mock", "model": "mock", "seeds": 3}]
+
+
+def test_seeds_shown_to_a_local_generator_are_not_warned_about(fag, tmp_path, caplog):
+    result = judged_world_run(fag, tmp_path)
+    assert "few-shot seed" not in caplog.text
+    assert result.run.read_stage("spec")["seeds_sent_to"] == []

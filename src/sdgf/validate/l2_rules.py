@@ -25,8 +25,10 @@ if TYPE_CHECKING:
     from sdgf.spec.compile import CompiledSpec
 
 LABEL_FIELD = "label"
-# Hook failures on a bad record (missing or unknown fact) are record errors, not bugs.
-HOOK_RECORD_ERRORS = (KeyError, TypeError, ValueError)
+# Hook failures on a bad record (a missing, null or wrongly typed fact) are record errors:
+# the candidate is sent back. A hook that fails on every record then stalls its cells
+# with this code named, instead of crashing the run.
+HOOK_RECORD_ERRORS = (KeyError, TypeError, ValueError, AttributeError, IndexError)
 
 
 @dataclass(frozen=True)

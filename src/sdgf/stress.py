@@ -181,6 +181,10 @@ def _with_fallback_reasons(spec: dict[str, Any]) -> None:
     spec["models"]["fallback_judge"] = dict(spec["models"]["judge"])
 
 
+def _vote_on_every_record(spec: dict[str, Any]) -> None:
+    spec["validation"].setdefault("escalation", {})["always"] = True
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
         "1",
@@ -301,17 +305,18 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
         "15",
         "judge ignores temperature (L6 votes have no spread)",
-        "detect that L6 votes are not independent (warn or refuse)",
+        "warn that L6 votes are not independent",
         {"judge": ("drop_temperature", lambda n, t: True)},
         lambda r: r["extra"].get("identical_vote_share", 0) < 1.0 or r["extra"].get("warned"),
+        edit_spec=_vote_on_every_record,
         special="temperature_judge",
     ),
     Scenario(
         "16",
         "sensitive seed text, external generator",
-        "mask or refuse seed text the stage 0 scan can't recognise before it leaves",
+        "warn that seed text goes to an external model, and record it",
         {},
-        lambda r: not r["extra"].get("leaked"),
+        lambda r: bool(r["extra"].get("warned")),
         special="sensitive_seed",
     ),
 )
@@ -322,7 +327,14 @@ SCENARIOS: tuple[Scenario, ...] = (
 
 # Frames that only pass a call through (metering, concurrency caps, tracing, this tool),
 # skipped so the location names the sdgf code that made the failing call.
-_PASS_THROUGH = ("stress.py", "usage.py", f"models{os.sep}base.py", "tracing.py", "mock.py")
+_PASS_THROUGH = (
+    "stress.py",
+    "usage.py",
+    "retry.py",
+    f"models{os.sep}base.py",
+    "tracing.py",
+    "mock.py",
+)
 
 
 def _innermost_sdgf_frame(tb: Any) -> str | None:
@@ -407,7 +419,6 @@ def _vote_spread(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "voted_records": voted,
         "identical_vote_share": round(identical / voted, 2) if voted else 0.0,
-        "warned": False,  # sdgf has no check for votes without spread
     }
 
 
@@ -487,6 +498,9 @@ def run_scenario(
                 .splitlines()
             ]
             out["extra"].update(_vote_spread(records))
+            out["extra"]["warned"] = bool(result.snapshot.get("l6_votes", {}).get("warning"))
+        if sc.special == "sensitive_seed":
+            out["extra"]["warned"] = bool(result.run.read_stage("spec").get("seeds_sent_to"))
         if sc.special == "cell_never_fills":
             out["extra"]["stalled_cells"] = result.snapshot.get("stalled_cells")
     except BaseException as e:  # a crash is a finding, not a tool failure

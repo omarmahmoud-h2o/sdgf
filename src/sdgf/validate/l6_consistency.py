@@ -100,17 +100,25 @@ class BackendAnswerer:
         return self.backend.call(prompt, self.max_tokens, self.temperature(index)).text
 
 
-def ballot(voter: Any, index: int, vote: Any) -> dict[str, Any]:
-    """One vote with where it came from: {stage, model, temperature, vote}."""
+def ballot(voter: Any, index: int, vote: Any, error: str | None = None) -> dict[str, Any]:
+    """One vote with where it came from: {stage, model, temperature, vote}, plus the
+    error when the voter's model failed and the vote became an abstention."""
     temperature = getattr(voter, "temperature", None)
     if callable(temperature):
         temperature = temperature(index)
-    return {
+    out = {
         "stage": getattr(voter, "stage", None),
         "model": getattr(getattr(voter, "backend", None), "model", None),
         "temperature": temperature,
         "vote": vote,
     }
+    if error is not None:
+        out["error"] = error
+    return out
+
+
+def _failed(e: Exception) -> str:
+    return f"{type(e).__name__}: {e}"
 
 
 def vote_stage(compiled: CompiledSpec) -> str:
@@ -313,11 +321,15 @@ class ConsistencyLayer(Layer):
         ballots: list[dict[str, Any]] = []
         for i in range(self.k):
             voter = self.voters[i % len(self.voters)]
+            error = None
             try:
                 verdicts.append(voter.judge(view).verdict)
             except JudgeParseError:
                 verdicts.append(None)
-            ballots.append(ballot(voter, i, verdicts[-1]))
+            except Exception as e:  # one voter's model failing is an abstention
+                verdicts.append(None)
+                error = _failed(e)
+            ballots.append(ballot(voter, i, verdicts[-1], error))
         cast = [v for v in verdicts if v is not None]
         agree = sum(verdict_means(self.labels, v, label) for v in cast)
         top, _, _ = majority(verdicts)
@@ -347,7 +359,15 @@ class ConsistencyLayer(Layer):
         return LayerVerdict(self.name, "fail_repairable", (issue,), details)
 
     def _answer_votes(self, record: Record, view: Record) -> LayerVerdict:
-        responses = [self.answerer(view, i) for i in range(self.k)]
+        responses: list[str | None] = []
+        errors: list[str | None] = []
+        for i in range(self.k):
+            try:
+                responses.append(self.answerer(view, i))
+                errors.append(None)
+            except Exception as e:  # one voter's model failing is an abstention
+                responses.append(None)
+                errors.append(_failed(e))
         answers = [None if r is None else self.extractor(r) for r in responses]
         top, count, cast = majority(answers)
         details: dict[str, Any] = {
@@ -355,7 +375,9 @@ class ConsistencyLayer(Layer):
             "method": "votes",
             "k": self.k,
             "votes": answers,
-            "ballots": [ballot(self.answerer, i, a) for i, a in enumerate(answers)],
+            "ballots": [
+                ballot(self.answerer, i, a, err) for i, (a, err) in enumerate(zip(answers, errors))
+            ],
             "cast": cast,
             "abstained": self.k - cast,
             "agree": count,
