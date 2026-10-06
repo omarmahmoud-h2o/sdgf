@@ -328,6 +328,29 @@ all invocations. `max_cost_usd` is an error if any stage in use is unpriced.
    small mock run: `--target-size 20 --backends your_module:factory`. Then add tests
    under `tests/` that use `MockBackend` only.
 
+## Stress testing a task
+
+`python -m sdgf.stress` shows where a run breaks. Each scenario runs one small run (8
+records) in its own process after injecting one failure: garbage or cut-off model replies,
+a backend error or HTTP 429, a judge, reason writer or L6 voter failing, a crashing hook,
+a cell that never fills, a run killed and resumed, a read-only store, a judge that ignores
+temperature, and sensitive seed text sent to an external generator.
+
+```bash
+python -m sdgf.stress tasks/fag --backends tests/cli_backends.py:fag_world
+python -m sdgf.stress tasks/fag --backends ... --only 5 12     # some scenarios
+python -m sdgf.stress tasks/fag --real                         # one small run on the spec's own models (asks first)
+```
+
+Each row ends as `COMPLETED`, `STOPPED <reason>`, `CRASHED <Error> at file:line` (the sdgf
+line that made the failing call) or `HUNG > Ns` (killed at `--timeout`), with `OK`, or `BUG`
+and what should have happened. The table prints to the terminal and `stress_report.md`
+adds each row's error, measurements and sdgf-only traceback. It never fails a build.
+
+`--backends` gives the healthy models the faults are injected into (the `--backends`
+format of `sdgf run`, returning at least a generator and a judge). For a new use case,
+write a mock plugin like `tests/cli_backends.py` that returns valid replies for your task.
+
 ## Tracing with LangSmith
 
 `run`, `resume` and `release` accept `--trace langsmith`. Every candidate becomes one
