@@ -70,6 +70,20 @@ LOG_FILE = "log.txt"
 
 _SRC_ROOT = Path(__file__).resolve().parents[1]  # the directory holding the sdgf package
 
+# What a worker keeps of the caller's environment when it must not inherit the rest
+# (e.g. API keys) because it runs code an agent wrote.
+ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ", "SYSTEMROOT")
+
+
+def child_env(extra: Mapping[str, str] = {}, *, inherit: bool = True) -> dict[str, str]:
+    """The environment for an sdgf subprocess: all of this one's (inherit) or only
+    ENV_KEEP, then extra, with the sdgf package importable."""
+    base = dict(os.environ) if inherit else {k: os.environ[k] for k in ENV_KEEP if k in os.environ}
+    env = {**base, **extra}
+    paths = [str(_SRC_ROOT), *filter(None, env.get("PYTHONPATH", "").split(os.pathsep))]
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
+    return env
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -133,6 +147,8 @@ class JobManager:
     which model overrides a job may use (backends, a MODULE:ATTR reference), how long a
     job may run and how many may run at once, and the largest target size. service
     resolves task names, so an agent-facing manager passes one built with allow_paths=False.
+    inherit_env=False gives workers only ENV_KEEP plus env, for jobs running code an agent
+    wrote (a draft's hooks.py), so it can't read the server's API keys.
     """
 
     def __init__(
@@ -146,6 +162,7 @@ class JobManager:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_target_size: int | None = None,
         env: Mapping[str, str] | None = None,
+        inherit_env: bool = True,
     ):
         self.store = store if isinstance(store, ArtefactStore) else ArtefactStore(store)
         self.service = service if service is not None else Service(self.store)
@@ -155,6 +172,7 @@ class JobManager:
         self.timeout_s = timeout_s
         self.max_target_size = max_target_size
         self.env = dict(env or {})
+        self.inherit_env = inherit_env
         self.root = self.store.root.resolve() / JOBS_DIR
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
 
@@ -171,9 +189,11 @@ class JobManager:
         max_rounds: int = DEFAULT_MAX_ROUNDS,
         version: str | None = None,
         trace: TraceSettings | None = None,
+        label: str | None = None,
     ) -> dict[str, Any]:
         """Start a job and return its status at once. run and release make a run id when
-        none is given; resume and evaluate default to the spec_version's latest run."""
+        none is given; resume and evaluate default to the spec_version's latest run.
+        label is the task name statuses show, when task is a path a caller must not see."""
         if kind not in KINDS:
             raise ServiceError(f"unknown job kind {kind!r}; have {list(KINDS)}", code="bad_kind")
         if kind == "release" and self.releases is None:
@@ -193,7 +213,8 @@ class JobManager:
         return self._spawn(
             {
                 "kind": kind,
-                "task": str(task),
+                "task": label or str(task),
+                "task_ref": str(task),
                 "task_dir": str(task_dir.resolve()),
                 "run_id": run_id,
                 "options": dataclasses.asdict(options),
@@ -220,13 +241,14 @@ class JobManager:
         trace = TraceSettings(**job["trace"]) if job["trace"] else None
         restarted = self.start(
             job["kind"],
-            job["task"],
+            job.get("task_ref", job["task"]),
             run_id=status["run_id"],
             options=options,
             waive=job["waive"],
             max_rounds=job["max_rounds"],
             version=job["version"],
             trace=trace,
+            label=job["task"],
         )
         return {**restarted, "restarted_from": job_id}
 
@@ -249,7 +271,7 @@ class JobManager:
                     stderr=subprocess.STDOUT,
                     pass_fds=(fd,),
                     start_new_session=True,  # its own process group, so cancel reaches it all
-                    env=self._child_env(),
+                    env=child_env(self.env, inherit=self.inherit_env),
                 )
         except OSError as e:
             _write_result(
@@ -265,12 +287,6 @@ class JobManager:
         self._procs[job_id] = proc
         _write_json(job_dir / JOB_FILE, {**job, "pid": proc.pid})
         return self.status(job_id)
-
-    def _child_env(self) -> dict[str, str]:
-        env = {**os.environ, **self.env}
-        paths = [str(_SRC_ROOT), *filter(None, env.get("PYTHONPATH", "").split(os.pathsep))]
-        env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
-        return env
 
     # ── watching ─────────────────────────────────────────────────
 

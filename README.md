@@ -435,6 +435,29 @@ applies to every job and is the operator's choice, not the agent's. The quick to
 import the task's `hooks.py` in the server process, so serve only tasks you trust.
 `--http` has no authentication yet and binds only to a loopback address.
 
+**Agents writing tasks.** With `--drafts DIR`, agents also get `list_drafts`,
+`create_draft` (empty, or a copy of a task), `read_draft`, `write_draft_file`,
+`append_seeds`, `delete_draft_file`, `validate_draft`, `dry_run_draft` and `submit_draft`.
+Drafts live in their own workspace; only a person can turn one into a task:
+
+```bash
+python -m sdgf.mcp ... --drafts /srv/sdgf/drafts --dry-run-backends cli_backends:fag_world \
+    [--dry-run-max-target 10] [--hooks allow|deny]
+python -m sdgf.cli drafts --drafts /srv/sdgf/drafts list
+python -m sdgf.cli drafts --drafts /srv/sdgf/drafts show NAME --into tasks/   # files, diff, validation
+python -m sdgf.cli drafts --drafts /srv/sdgf/drafts approve NAME --reviewer "A. Reviewer" --into tasks/
+python -m sdgf.cli drafts --drafts /srv/sdgf/drafts reject NAME --reviewer "A. Reviewer" --reason "..."
+```
+
+Approval binds to the exact bytes submitted: any edit afterwards withdraws it, so a
+person approves only what they saw. A draft's `hooks.py` is code an agent wrote: it is
+imported only in a subprocess that gets `PATH`, `HOME`, locale and temp settings and
+nothing else of the server's environment (no API keys), with a timeout. That is not a
+sandbox (it can still reach the network and the file system), so `--hooks` defaults to
+`deny` over `--http`; a draft copied from a task keeps that task's approved `hooks.py`.
+Dry runs use `--dry-run-backends`, check L1–L4 only, make at most `--dry-run-max-target`
+records, and write to the drafts' own store, apart from real runs.
+
 ## Optional adapters
 
 Heavy engines are imported lazily, only when you build their adapter. The core and the

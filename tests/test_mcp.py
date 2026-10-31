@@ -64,8 +64,8 @@ def session(srv, calls):
     async def go():
         async with Client(srv) as client:
 
-            async def call(name, **args):
-                result = await client.call_tool(name, args)
+            async def call(tool, /, **args):
+                result = await client.call_tool(tool, args)
                 if result.is_error:
                     text = result.content[0].text
                     raise ToolFailed(json.loads(text[text.index("{") :]))

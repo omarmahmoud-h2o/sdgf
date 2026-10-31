@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
-_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
 class TaskRegistry:
@@ -20,7 +20,7 @@ class TaskRegistry:
 
     def find(self, name: str) -> Path | None:
         """The task directory for name, from the first root that has it, else None."""
-        if not _NAME.fullmatch(name):
+        if not NAME_RE.fullmatch(name):
             return None
         for root in self.roots:
             task_dir = root / name

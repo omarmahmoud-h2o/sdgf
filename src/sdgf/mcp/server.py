@@ -17,6 +17,15 @@ detail=True, and records come a page at a time, so replies fit an agent's contex
 Quick tools (list_tasks, describe_task, validate_spec, plan, get_records, list_reviews)
 compile the task in this process, which imports its hooks.py: serve only tasks you trust.
 
+Authoring (with --drafts): agents create and edit task specs in a drafts workspace,
+validate them and dry-run them as jobs, then submit them. A draft's hooks.py is code an
+agent wrote: it is only ever imported in a subprocess that gets none of the server's
+environment beyond the basics (no API keys), and dry runs use --dry-run-backends, are
+capped at --dry-run-max-target records, run L1-L4 only, and write to the drafts'
+own store. A person approves a submitted draft with `sdgf drafts approve`, which copies
+it into a task directory; only then can start_run use it. Agents may write hooks.py only
+with --hooks allow (the default over stdio; over --http the default is deny).
+
 HTTP has no authentication yet, so it binds only to a loopback address.
 """
 
@@ -35,6 +44,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
+from sdgf.drafts import DraftStore
 from sdgf.jobs import DEFAULT_MAX_RUNNING, DEFAULT_TIMEOUT_S, JobManager
 from sdgf.service import Outcome, RunOptions, Service, ServiceError, TaskRegistry
 
@@ -50,6 +60,10 @@ sdgf builds synthetic datasets from task specs. Typical flow:
    a job id at once; poll job_status or block briefly with wait_job.
 4. get_records pages through accepted records; start_evaluate checks the release targets.
 A job that was cancelled, timed out or lost continues where it stopped with restart_job.
+To write a new task (when the draft tools are present): create_draft (often copying a
+task with from_task), edit it with write_draft_file and append_seeds, check it with
+validate_draft and dry_run_draft (a small free run on test models), then submit_draft.
+A person approves or rejects it; read_draft shows a rejection's reason.
 Errors are JSON with a code, a message and a hint saying what to do instead."""
 
 # Keys of a step's result that stay in a brief job status; the rest need detail=True.
@@ -90,6 +104,10 @@ class ServerConfig:
     max_target_size: int | None = None
     waivable: frozenset[str] = field(default_factory=frozenset)
     env: Mapping[str, str] = field(default_factory=dict)  # extra environment for job workers
+    drafts: Path | None = None  # the drafts workspace; without it, no authoring tools
+    allow_hooks: bool = False
+    dry_run_backends: str | None = None  # MODULE:ATTR; without it, no dry runs
+    dry_run_max_target: int = 10
 
 
 def _tool_error(e: Exception) -> ToolError:
@@ -142,6 +160,28 @@ def build_server(config: ServerConfig) -> MCPServer:
         max_target_size=config.max_target_size,
         env=config.env,
     )
+
+    drafts: DraftStore | None = None
+    dry_jobs: JobManager | None = None
+    if config.drafts is not None:
+        drafts = DraftStore(config.drafts, allow_hooks=config.allow_hooks, env=config.env)
+        if config.dry_run_backends is not None:
+            # A draft's hooks.py runs in these workers: no inherited environment, so no keys.
+            dry_jobs = JobManager(
+                drafts.store_root,
+                releases=None,
+                backends=config.dry_run_backends,
+                max_running=config.max_running,
+                timeout_s=config.timeout_s,
+                max_target_size=config.dry_run_max_target,
+                env=config.env,
+                inherit_env=False,
+            )
+
+    def manager_for(job_id: str) -> JobManager:
+        if dry_jobs is not None and (dry_jobs.root / job_id / "job.json").is_file():
+            return dry_jobs
+        return jobs
 
     def check_waivers(waive: Iterable[str] | None) -> list[str]:
         waive = list(waive or [])
@@ -253,7 +293,7 @@ def build_server(config: ServerConfig) -> MCPServer:
     def job_status(job_id: str, detail: bool = False) -> dict[str, Any]:
         """A job's state (running, finished, failed, timed_out, cancelled, lost), progress
         and result. detail=True includes the full result (e.g. every metric)."""
-        return _brief(jobs.status(job_id), detail)
+        return _brief(manager_for(job_id).status(job_id), detail)
 
     @server.tool(annotations=READ_ONLY)
     @_errors_as_tool_errors
@@ -261,27 +301,30 @@ def build_server(config: ServerConfig) -> MCPServer:
         """Wait up to timeout_s seconds (at most 120) for a job to stop running, then
         return its status as job_status does."""
         timeout = min(max(timeout_s, 0.0), MAX_WAIT_S)
-        return _brief(jobs.wait(job_id, timeout=timeout), detail)
+        return _brief(manager_for(job_id).wait(job_id, timeout=timeout), detail)
 
     @server.tool(annotations=READ_ONLY)
     @_errors_as_tool_errors
     def list_jobs() -> dict[str, Any]:
-        """Every job in this store, oldest first, with its state and progress."""
+        """Every job, oldest first, with its state and progress; dry_run marks a draft's."""
         keys = ("job_id", "kind", "task", "state", "run_id", "created_at", "progress")
-        return {"jobs": [{k: j[k] for k in keys} for j in jobs.list()]}
+        listed = [{**{k: j[k] for k in keys}, "dry_run": False} for j in jobs.list()]
+        if dry_jobs is not None:
+            listed += [{**{k: j[k] for k in keys}, "dry_run": True} for j in dry_jobs.list()]
+        return {"jobs": sorted(listed, key=lambda j: (j["created_at"], j["job_id"]))}
 
     @server.tool(annotations=CHANGES_JOB)
     @_errors_as_tool_errors
     def cancel_job(job_id: str) -> dict[str, Any]:
         """Stop a running job. Records it already accepted are kept; restart_job continues."""
-        return _brief(jobs.cancel(job_id), False)
+        return _brief(manager_for(job_id).cancel(job_id), False)
 
     @server.tool(annotations=STARTS_JOB)
     @_errors_as_tool_errors
     def restart_job(job_id: str) -> dict[str, Any]:
         """Continue a stopped job's run (cancelled, timed out, lost or failed) in a new job;
         nothing already accepted is generated again."""
-        return jobs.restart(job_id)
+        return manager_for(job_id).restart(job_id)
 
     # ── results ──────────────────────────────────────────────────
 
@@ -300,7 +343,89 @@ def build_server(config: ServerConfig) -> MCPServer:
         """Records the judge flagged for a person to review; a person resolves them."""
         return _outcome(service.review_list(task, run_id))
 
+    if drafts is not None:
+        _authoring_tools(server, config, service, drafts, dry_jobs)
     return server
+
+
+def _authoring_tools(
+    server: MCPServer,
+    config: ServerConfig,
+    service: Service,
+    drafts: DraftStore,
+    dry_jobs: JobManager | None,
+) -> None:
+    @server.tool(annotations=READ_ONLY)
+    @_errors_as_tool_errors
+    def list_drafts() -> dict[str, Any]:
+        """Every task draft and its state: editing, submitted, rejected or approved."""
+        return {"drafts": drafts.list()}
+
+    @server.tool(annotations=CHANGES_JOB)
+    @_errors_as_tool_errors
+    def create_draft(name: str, from_task: str | None = None) -> dict[str, Any]:
+        """Start a task draft, empty or a copy of an existing task's spec files."""
+        source = service.task_dir(from_task) if from_task is not None else None
+        return drafts.create(name, from_dir=source)
+
+    @server.tool(annotations=READ_ONLY)
+    @_errors_as_tool_errors
+    def read_draft(name: str) -> dict[str, Any]:
+        """A draft's task.yaml and hooks.py, a preview of its seeds, and its state (with a
+        person's reason if they rejected it)."""
+        return drafts.read(name)
+
+    @server.tool(annotations=CHANGES_JOB)
+    @_errors_as_tool_errors
+    def write_draft_file(name: str, file: str, content: str) -> dict[str, Any]:
+        """Replace one spec file of a draft: task.yaml, seeds.jsonl or hooks.py (if this
+        server allows agents to write hooks). Any edit needs submitting again."""
+        return drafts.write_file(name, file, content)
+
+    @server.tool(annotations=CHANGES_JOB)
+    @_errors_as_tool_errors
+    def append_seeds(name: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+        """Add example records to a draft's seeds.jsonl (at most 1000 per call)."""
+        return drafts.append_seeds(name, records)
+
+    @server.tool(annotations=CHANGES_JOB)
+    @_errors_as_tool_errors
+    def delete_draft_file(name: str, file: str) -> dict[str, Any]:
+        """Remove one spec file from a draft (e.g. hooks.py, which is optional)."""
+        return drafts.delete_file(name, file)
+
+    @server.tool(annotations=READ_ONLY)
+    @_errors_as_tool_errors
+    def validate_draft(name: str) -> dict[str, Any]:
+        """Compile a draft (in a separate process) and describe it, or say what is wrong.
+        warnings include where seed text would be sent."""
+        return drafts.validate(name)
+
+    @server.tool(annotations=STARTS_JOB)
+    @_errors_as_tool_errors
+    def dry_run_draft(name: str, target_size: int | None = None) -> dict[str, Any]:
+        """Start a small run of a draft on this server's test models, checks L1-L4 only,
+        as a job (see job_status). Shows whether the spec produces records that pass."""
+        if dry_jobs is None:
+            raise ServiceError(
+                "this server has no test models for dry runs",
+                code="no_dry_runs",
+                hint="validate_draft still checks that the draft compiles",
+            )
+        limit = config.dry_run_max_target
+        if target_size is not None and not 1 <= target_size <= limit:
+            raise ServiceError(
+                f"a dry run makes 1 to {limit} records; got {target_size}", code="limit_exceeded"
+            )
+        opts = RunOptions(target_size=target_size or limit, layers=("L1", "L2", "L3", "L4"))
+        return dry_jobs.start("run", drafts.spec_dir(name), options=opts, label=f"draft:{name}")
+
+    @server.tool(annotations=CHANGES_JOB)
+    @_errors_as_tool_errors
+    def submit_draft(name: str) -> dict[str, Any]:
+        """Validate a draft and submit exactly this content for a person to approve. Edits
+        afterwards withdraw it."""
+        return drafts.submit(name)
 
 
 # ── command line ─────────────────────────────────────────────────
@@ -322,6 +447,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="THRESHOLD",
         help="thresholds agents may waive (governance can never be waived)",
     )
+    p.add_argument("--drafts", type=Path, help="drafts workspace; enables the authoring tools")
+    p.add_argument(
+        "--hooks",
+        choices=["allow", "deny"],
+        help="may agents write a draft's hooks.py (default: allow over stdio, deny over --http)",
+    )
+    p.add_argument("--dry-run-backends", metavar="MODULE:ATTR", help="test models for dry runs")
+    p.add_argument("--dry-run-max-target", type=int, default=10)
     p.add_argument("--http", action="store_true", help="streamable HTTP instead of stdio")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
@@ -346,6 +479,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         timeout_s=args.timeout,
         max_target_size=args.max_target_size,
         waivable=frozenset(args.waivable),
+        drafts=args.drafts,
+        allow_hooks=(args.hooks or ("deny" if args.http else "allow")) == "allow",
+        dry_run_backends=args.dry_run_backends,
+        dry_run_max_target=args.dry_run_max_target,
     )
     server = build_server(config)
     if args.http:

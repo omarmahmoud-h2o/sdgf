@@ -7,6 +7,7 @@
     sdgf evaluate TASK --store S [--run-id R]    stages 4 and 5 over a run, read only
     sdgf review TASK --store S list|resolve      the run's HITL review queue
     sdgf release TASK --store S --releases DIR   stages 0 to 5 with refill rounds
+    sdgf drafts --drafts D list|show|approve|reject   review task specs agents wrote
 
 Every command prints one JSON object on stdout. Exit codes: 0 done, 1 finished but not
 complete (a run stopped short, a failed gate, no release), 2 an error, 3 the coverage plan
@@ -40,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from sdgf.coverage.plan import DEFAULT_SEED
+from sdgf.drafts import DraftStore
 from sdgf.hitl.queue import ApprovalPending
 from sdgf.pipeline import DEFAULT_MAX_ROUNDS
 from sdgf.service import (
@@ -237,6 +239,21 @@ def cmd_review(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_drafts(args: argparse.Namespace) -> int:
+    drafts = DraftStore(args.drafts, approved_root=getattr(args, "into", None))
+    if args.drafts_command == "list":
+        _print({"drafts": drafts.list()})
+    elif args.drafts_command == "show":
+        _print({**drafts.review(args.name), "validation": drafts.validate(args.name)})
+    elif args.drafts_command == "approve":
+        _print(
+            drafts.approve(args.name, reviewer=args.reviewer, note=args.note, replace=args.replace)
+        )
+    else:
+        _print(drafts.reject(args.name, reviewer=args.reviewer, reason=args.reason))
+    return EXIT_OK
+
+
 # ── parser ───────────────────────────────────────────────────────
 
 
@@ -348,6 +365,30 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--reason")
     r.add_argument("--new-label", help="the label for relabel, as JSON (e.g. true)")
     p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser(
+        "drafts",
+        help="review task specs agents wrote: list, show, approve or reject",
+        description="A person's side of agent authoring: approving copies the submitted "
+        "draft into a task directory, where runs can use it.",
+    )
+    p.add_argument("--drafts", required=True, help="the drafts workspace")
+    drafts = p.add_subparsers(dest="drafts_command", required=True)
+    drafts.add_parser("list", help="every draft and its state")
+    d = drafts.add_parser("show", help="a draft's files, diff and validation, for review")
+    d.add_argument("name")
+    d.add_argument("--into", help="the approved task root, to diff against the task it replaces")
+    d = drafts.add_parser("approve", help="copy a submitted draft into a task directory")
+    d.add_argument("name")
+    d.add_argument("--reviewer", required=True)
+    d.add_argument("--into", required=True, help="the approved task root, e.g. tasks/")
+    d.add_argument("--note")
+    d.add_argument("--replace", action="store_true", help="overwrite a task of that name")
+    d = drafts.add_parser("reject", help="send a submitted draft back with a reason")
+    d.add_argument("name")
+    d.add_argument("--reviewer", required=True)
+    d.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_drafts)
     return parser
 
 
