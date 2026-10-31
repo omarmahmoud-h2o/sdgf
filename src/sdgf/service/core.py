@@ -129,7 +129,7 @@ class Service:
     # ── tasks ────────────────────────────────────────────────────
 
     def compile(self, task: TaskRef) -> CompiledSpec:
-        return compile_spec(self._task_dir(task), tool_registry=TOOLS)
+        return compile_spec(self.task_dir(task), tool_registry=TOOLS)
 
     def list_tasks(self) -> Outcome:
         if self.tasks is None:
@@ -257,7 +257,7 @@ class Service:
     ) -> Outcome:
         """Continue run_id, or the latest run of the spec_version, with its saved options."""
         compiled = self.compile(task)
-        run_id = self._existing_run_id(compiled, run_id)
+        run_id = self.existing_run_id(compiled, run_id)
         return self._run(compiled, run_id, options, held_out, backends, trace)
 
     def evaluate(
@@ -273,7 +273,7 @@ class Service:
         """Stages 4 and 5 over a run, read only: metrics and the release check."""
         compiled = self.compile(task)
         store = self._require_store()
-        run_id = self._existing_run_id(compiled, run_id)
+        run_id = self.existing_run_id(compiled, run_id)
         opts = self._run_options(compiled, run_id, options)
         pipe = self._pipeline(compiled, opts, held_out, backends, None)
         run = store.open_run(compiled.spec_version, run_id)
@@ -382,7 +382,7 @@ class Service:
 
     # ── helpers ──────────────────────────────────────────────────
 
-    def _task_dir(self, task: TaskRef) -> Path:
+    def task_dir(self, task: TaskRef) -> Path:
         if self.tasks is not None and isinstance(task, str):
             found = self.tasks.find(task)
             if found is not None:
@@ -483,7 +483,7 @@ class Service:
         )
         return tracer
 
-    def _existing_run_id(self, compiled: CompiledSpec, run_id: str | None) -> str:
+    def existing_run_id(self, compiled: CompiledSpec, run_id: str | None) -> str:
         """run_id if given and present, else the latest run of this spec_version."""
         store = self._require_store()
         if run_id is not None:
@@ -504,7 +504,7 @@ class Service:
     def _queue(self, task: TaskRef, run_id: str | None) -> tuple[str, ReviewQueue, GoldSet]:
         compiled = self.compile(task)
         store = self._require_store()
-        run_id = self._existing_run_id(compiled, run_id)
+        run_id = self.existing_run_id(compiled, run_id)
         run = store.open_run(compiled.spec_version, run_id)
         gold = GoldSet.for_task(store, compiled.spec.task.name)
         return run_id, ReviewQueue.for_run(run, gold), gold

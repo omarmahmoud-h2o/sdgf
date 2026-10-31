@@ -2,6 +2,7 @@
 cli_backends:<name>` in a subprocess. No model or API calls."""
 
 import json
+import time
 
 from test_m4_checkpoint import World
 from test_pipeline import recipe_from_prompt
@@ -35,6 +36,17 @@ class UnsureWorld(World):
         return json.dumps(reply)
 
 
+class SlowWorld(World):
+    """World with a generator that takes SLOW_SECONDS a call, so a job is still running
+    when tests/test_jobs.py cancels, times out or kills it."""
+
+    SLOW_SECONDS = 0.15
+
+    def generate(self, call) -> str:
+        time.sleep(self.SLOW_SECONDS)
+        return super().generate(call)
+
+
 def fag_world(compiled):
     return World().backends()
 
@@ -45,6 +57,10 @@ def fag_broken(compiled):
 
 def fag_unsure(compiled):
     return UnsureWorld().backends()
+
+
+def fag_slow(compiled):
+    return SlowWorld().backends()
 
 
 not_callable = "not a factory"

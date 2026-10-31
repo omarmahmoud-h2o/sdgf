@@ -464,6 +464,7 @@ src/sdgf/
   store/       artefact store, provenance
   hitl/        review queue, plan approval
   service/     Service: every step as a call returning data (the CLI is a thin adapter); TaskRegistry
+  jobs.py      JobManager: run / resume / evaluate / release as background processes
   pipeline.py  cli.py
 tasks/fag/     task.yaml hooks.py seeds.jsonl
 tasks/cfa/     task.yaml seeds.jsonl
