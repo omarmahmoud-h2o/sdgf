@@ -59,6 +59,9 @@ _RUN_DEFAULTS: dict[str, Any] = {
     "max_attempts_per_cell": None,
 }
 
+MAX_PAGE = 100  # records per records() call
+PROVENANCE_KEY = "_provenance"
+
 BackendsFactory = Callable[[CompiledSpec], Mapping[str, ModelBackend]]
 Status = Literal["ok", "incomplete", "approval_pending"]
 TaskRef = str | Path
@@ -336,6 +339,43 @@ class Service:
                 "failing_metrics": result.gate.failing_metrics,
                 "short_cells": dict(result.gate.short_cells),
                 "rounds": result.rounds,
+            },
+        )
+
+    # ── results ──────────────────────────────────────────────────
+
+    def records(
+        self,
+        task: TaskRef,
+        run_id: str | None = None,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+        provenance: bool = False,
+    ) -> Outcome:
+        """One page of a run's accepted records (the latest run by default), without their
+        audit trail unless provenance. Works while the run is still going."""
+        if offset < 0 or not 1 <= limit <= MAX_PAGE:
+            raise ServiceError(
+                f"offset must be >= 0 and limit 1 to {MAX_PAGE}; got {offset}, {limit}",
+                code="bad_page",
+            )
+        compiled = self.compile(task)
+        run_id = self.existing_run_id(compiled, run_id)
+        run = self._require_store().open_run(compiled.spec_version, run_id)
+        rows = run.read_jsonl("accepted")
+        page = rows[offset : offset + limit]
+        if not provenance:
+            page = [{k: v for k, v in r.items() if k != PROVENANCE_KEY} for r in page]
+        end = offset + len(page)
+        return Outcome(
+            "ok",
+            {
+                "run_id": run_id,
+                "total": len(rows),
+                "offset": offset,
+                "records": page,
+                "next_offset": end if end < len(rows) else None,
             },
         )
 

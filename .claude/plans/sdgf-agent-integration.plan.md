@@ -2,7 +2,7 @@
 
 **Created**: 2026-10-31
 **Complexity**: Large (phases 1-3 give a usable run-only integration)
-**Status**: Phases 1-2 done; Phase 3 next
+**Status**: Phases 1-3 done; Phase 4 next
 
 ## Summary
 
@@ -122,6 +122,6 @@ Pipeline / ArtefactStore (unchanged)
 ## Acceptance
 - [x] Phase 1: service layer, CLI on top, tests green (2026-10-31)
 - [x] Phase 2: jobs (2026-10-31; the killed-mid-wave and hung-worker cases are tests in tests/test_jobs.py rather than sdgf.stress scenarios)
-- [ ] Phase 3: MCP adapter
+- [x] Phase 3: MCP adapter (2026-10-31; mcp 2.x SDK, 14 tools; manual check from Claude Code still to do)
 - [ ] Phase 4: authoring
 - [ ] Phase 5: hardening and Python client

@@ -402,6 +402,39 @@ release lists it under `trace_sinks` in `governance_report.json` and in the data
 Held-out matches are scrubbed: an L4 issue against the held-out set reaches a span without
 its key or message. `sdgf plan` and judge calibration aren't traced.
 
+## Using sdgf from agents (MCP)
+
+`python -m sdgf.mcp` serves the tasks under one or more directories to MCP clients
+(Claude Code, the Claude Agent SDK, other agents). Agents name tasks; they never pass
+paths. You, the operator, fix everything that costs money or is a person's decision:
+
+```bash
+pip install -e '.[mcp]'
+python -m sdgf.mcp --store /srv/sdgf/store --tasks tasks/ --releases /srv/sdgf/releases \
+    [--max-running 2] [--timeout 3600] [--max-target-size 500] [--waivable kappa_min ...] \
+    [--http [--host 127.0.0.1] [--port 8765]]
+claude mcp add sdgf -- python -m sdgf.mcp --store ... --tasks tasks/   # e.g. in Claude Code
+```
+
+| Tools | |
+|---|---|
+| `list_tasks`, `describe_task`, `validate_spec`, `plan` | quick, answered at once |
+| `start_run`, `start_release`, `start_evaluate` | start a job and return its id at once |
+| `job_status`, `wait_job`, `list_jobs`, `cancel_job`, `restart_job` | follow, stop and continue jobs |
+| `get_records`, `list_reviews` | read results, a page of records at a time |
+
+Jobs (`sdgf.jobs`) run each step in its own process with its state under
+`<store>/jobs/`, so they outlive the server, and `restart_job` continues a cancelled,
+timed-out or lost job's run without generating accepted records again. A job status is
+brief unless `detail=True`.
+
+Not tools, on purpose: approving a coverage plan and resolving review items stay with a
+person (`sdgf plan --approve`, `sdgf review resolve`); the tools say what is waiting.
+Agents can waive only the thresholds in `--waivable`, never governance. `--backends`
+applies to every job and is the operator's choice, not the agent's. The quick tools
+import the task's `hooks.py` in the server process, so serve only tasks you trust.
+`--http` has no authentication yet and binds only to a loopback address.
+
 ## Optional adapters
 
 Heavy engines are imported lazily, only when you build their adapter. The core and the
@@ -415,6 +448,7 @@ test suite never need them.
 | `docs` | `markdown` | not an adapter: `docs/build_guide.py` uses it to build `docs/sdgf-guide.html` |
 | `retrieval` | `rank-bm25` | not required: `coverage/retrieval.py` is a pure-Python BM25 that scores the same as `rank_bm25.BM25Okapi` |
 | `tracing` | `langsmith` | `tracing.LangSmithTracer`, used by `--trace langsmith` (see [Tracing with LangSmith](#tracing-with-langsmith)) |
+| `mcp` | `mcp` (2.x) | `mcp.server.build_server`, the MCP server agents use (see [Using sdgf from agents](#using-sdgf-from-agents-mcp)) |
 
 Install an extra with `pip install -e '.[pii]'`. Model SDKs work the same way:
 `openai_compat` needs only the standard library, `anthropic` uses `anthropic`, `vllm`
