@@ -463,6 +463,7 @@ src/sdgf/
   evaluation/  metrics, diversity, gate, reports (stages 4–5)
   store/       artefact store, provenance
   hitl/        review queue, plan approval
+  service/     Service: every step as a call returning data (the CLI is a thin adapter); TaskRegistry
   pipeline.py  cli.py
 tasks/fag/     task.yaml hooks.py seeds.jsonl
 tasks/cfa/     task.yaml seeds.jsonl
