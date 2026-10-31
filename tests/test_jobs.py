@@ -182,3 +182,15 @@ def test_a_release_needs_a_configured_release_directory(tmp_path):
     with pytest.raises(ServiceError) as e:
         jobs.start("release", TASKS / "fag")
     assert e.value.code == "no_releases"
+
+
+def test_held_out_files_reach_the_worker_but_are_never_written(tmp_path):
+    held = tmp_path / "secret-held-out-items.jsonl"
+    held.write_text("".join((TASKS / "fag" / "seeds.jsonl").read_text().splitlines(True)[:3]))
+    jobs = manager(tmp_path, held_out=[held])
+    finished(jobs, jobs.start("run", "fag", options=NO_JUDGE)["job_id"])
+    evaluated = finished(jobs, jobs.start("evaluate", "fag")["job_id"])
+    assert "held_out" in evaluated["data"]["metrics"]["overall"]["overlap"]
+    for path in (tmp_path / "store").rglob("*"):
+        if path.is_file():
+            assert held.name not in path.read_text(errors="ignore"), path

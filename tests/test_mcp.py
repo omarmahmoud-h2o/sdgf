@@ -37,6 +37,7 @@ TOOLS = {
     "restart_job",
     "get_records",
     "list_reviews",
+    "my_usage",
 }
 
 

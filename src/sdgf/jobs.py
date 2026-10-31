@@ -67,6 +67,8 @@ LOCK_FILE = "lock"
 WORKER_FILE = "worker.json"
 RESULT_FILE = "result.json"
 LOG_FILE = "log.txt"
+RUN_JOBS_STAGE = "jobs"  # in a run directory: the jobs (and their clients) that ran it
+HELD_OUT_ENV = "SDGF_JOB_HELD_OUT"  # held-out paths reach a worker only through its environment
 
 _SRC_ROOT = Path(__file__).resolve().parents[1]  # the directory holding the sdgf package
 
@@ -148,7 +150,9 @@ class JobManager:
     job may run and how many may run at once, and the largest target size. service
     resolves task names, so an agent-facing manager passes one built with allow_paths=False.
     inherit_env=False gives workers only ENV_KEEP plus env, for jobs running code an agent
-    wrote (a draft's hooks.py), so it can't read the server's API keys.
+    wrote (a draft's hooks.py), so it can't read the server's API keys. held_out paths turn
+    on the L4 held-out check; like the CLI's --held-out they are never written down, here
+    not even in the job's directory: the worker gets them in its environment.
     """
 
     def __init__(
@@ -163,6 +167,7 @@ class JobManager:
         max_target_size: int | None = None,
         env: Mapping[str, str] | None = None,
         inherit_env: bool = True,
+        held_out: Sequence[str | Path] = (),
     ):
         self.store = store if isinstance(store, ArtefactStore) else ArtefactStore(store)
         self.service = service if service is not None else Service(self.store)
@@ -173,6 +178,7 @@ class JobManager:
         self.max_target_size = max_target_size
         self.env = dict(env or {})
         self.inherit_env = inherit_env
+        self.held_out = [str(Path(p).resolve()) for p in held_out]
         self.root = self.store.root.resolve() / JOBS_DIR
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
 
@@ -190,10 +196,12 @@ class JobManager:
         version: str | None = None,
         trace: TraceSettings | None = None,
         label: str | None = None,
+        client: str | None = None,
     ) -> dict[str, Any]:
         """Start a job and return its status at once. run and release make a run id when
         none is given; resume and evaluate default to the spec_version's latest run.
-        label is the task name statuses show, when task is a path a caller must not see."""
+        label is the task name statuses show, when task is a path a caller must not see.
+        client is who asked, recorded with the job and in the run it touches."""
         if kind not in KINDS:
             raise ServiceError(f"unknown job kind {kind!r}; have {list(KINDS)}", code="bad_kind")
         if kind == "release" and self.releases is None:
@@ -215,6 +223,7 @@ class JobManager:
                 "kind": kind,
                 "task": label or str(task),
                 "task_ref": str(task),
+                "client": client,
                 "task_dir": str(task_dir.resolve()),
                 "run_id": run_id,
                 "options": dataclasses.asdict(options),
@@ -249,6 +258,7 @@ class JobManager:
             version=job["version"],
             trace=trace,
             label=job["task"],
+            client=job.get("client"),
         )
         return {**restarted, "restarted_from": job_id}
 
@@ -257,6 +267,11 @@ class JobManager:
         job_dir = self.root / job_id
         job_dir.mkdir(parents=True)
         job = {"id": job_id, "created_at": _now(), **request}
+        if job["trace"] is not None:
+            tags = [*job["trace"]["tags"], f"job:{job_id}"]
+            if job["client"] is not None:
+                tags.append(f"client:{job['client']}")
+            job["trace"] = {**job["trace"], "tags": tags}
         _write_json(job_dir / JOB_FILE, job)
         # The manager takes the lock and hands it to the worker, so the job counts as
         # running from the moment it exists; the lock goes when the worker exits.
@@ -271,7 +286,7 @@ class JobManager:
                     stderr=subprocess.STDOUT,
                     pass_fds=(fd,),
                     start_new_session=True,  # its own process group, so cancel reaches it all
-                    env=child_env(self.env, inherit=self.inherit_env),
+                    env=child_env(self._worker_env(), inherit=self.inherit_env),
                 )
         except OSError as e:
             _write_result(
@@ -312,6 +327,7 @@ class JobManager:
             "created_at": job["created_at"],
             "started_at": worker.get("started_at"),
             "finished_at": (result or {}).get("finished_at"),
+            "client": job.get("client"),
             "progress": self._progress(spec_version, run_id),
         }
         if result is not None:
@@ -326,10 +342,13 @@ class JobManager:
             }
         return status
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, client: str | None = None) -> list[dict[str, Any]]:
+        """Every job, oldest first; only client's when client is given."""
         if not self.root.is_dir():
             return []
         jobs = [self.status(d.name) for d in self.root.iterdir() if (d / JOB_FILE).is_file()]
+        if client is not None:
+            jobs = [j for j in jobs if j["client"] == client]
         return sorted(jobs, key=lambda j: (j["created_at"], j["job_id"]))
 
     def wait(self, job_id: str, timeout: float | None = None, poll: float = 0.2) -> dict[str, Any]:
@@ -390,6 +409,27 @@ class JobManager:
             )
         return self.status(job_id)
 
+    def usage(self, client: str | None = None) -> dict[str, Any]:
+        """What client's jobs have used, from their runs' usage ledgers. A run continued by
+        several jobs counts once. Runs on unpriced models add tokens but no cost."""
+        runs: dict[tuple[str, str], dict[str, Any]] = {}
+        for job in self.list(client):
+            usage = (job["progress"] or {}).get("usage")
+            if job["spec_version"] and job["run_id"] and isinstance(usage, dict):
+                runs[(job["spec_version"], job["run_id"])] = usage
+        costs = [u.get("cost_usd") for u in runs.values()]
+        return {
+            "runs": len(runs),
+            "tokens": sum(int(u.get("tokens") or 0) for u in runs.values()),
+            "cost_usd": sum(c for c in costs if c is not None),
+            "unpriced_runs": sum(1 for c in costs if c is None),
+        }
+
+    def _worker_env(self) -> dict[str, str]:
+        if not self.held_out:
+            return self.env
+        return {**self.env, HELD_OUT_ENV: os.pathsep.join(self.held_out)}
+
     def _job(self, job_id: str) -> dict[str, Any]:
         job = None
         if job_id and "/" not in job_id and job_id not in (".", ".."):
@@ -436,27 +476,57 @@ def _execute(job_dir: Path, job: Mapping[str, Any]) -> Outcome:
             "started_at": _now(),
         },
     )
+    _record_on_run(store, job, compiled.spec_version, run_id)  # a run that already exists
     backends = load_backends(job["backends"]) if job["backends"] else None
     trace = TraceSettings(**job["trace"]) if job["trace"] else None
+    held_out = [p for p in os.environ.get(HELD_OUT_ENV, "").split(os.pathsep) if p] or None
+    try:
+        return _step(service, job, run_id, options, backends, trace, held_out)
+    finally:
+        _record_on_run(store, job, compiled.spec_version, run_id)  # a run this job made
+
+
+def _step(
+    service: Service,
+    job: Mapping[str, Any],
+    run_id: str | None,
+    options: RunOptions,
+    backends: Any,
+    trace: TraceSettings | None,
+    held_out: list[str] | None,
+) -> Outcome:
+    kind, task = job["kind"], job["task_dir"]
+    common = {"options": options, "held_out": held_out, "backends": backends}
     if kind == "run":
-        return service.run(task, run_id, options=options, backends=backends, trace=trace)
+        return service.run(task, run_id, trace=trace, **common)
     if kind == "resume":
-        return service.resume(task, run_id, options=options, backends=backends, trace=trace)
+        return service.resume(task, run_id, trace=trace, **common)
     if kind == "evaluate":
-        return service.evaluate(
-            task, run_id, options=options, backends=backends, waive=job["waive"]
-        )
+        return service.evaluate(task, run_id, waive=job["waive"], **common)
     return service.release(
         task,
         job["releases"],
         run_id,
-        options=options,
-        backends=backends,
         trace=trace,
+        **common,
         max_rounds=job["max_rounds"],
         waive=job["waive"],
         version=job["version"],
     )
+
+
+def _record_on_run(
+    store: ArtefactStore, job: Mapping[str, Any], spec_version: str, run_id: str | None
+) -> None:
+    """Add this job, and who asked for it, to the run's jobs.json (once)."""
+    if run_id is None or run_id not in store.runs(spec_version):
+        return
+    run = store.open_run(spec_version, run_id)
+    entries = run.read_stage(RUN_JOBS_STAGE) if run.has_stage(RUN_JOBS_STAGE) else []
+    if any(e["job_id"] == job["id"] for e in entries):
+        return
+    entry = {"job_id": job["id"], "kind": job["kind"], "client": job.get("client"), "at": _now()}
+    run.write_stage(RUN_JOBS_STAGE, [*entries, entry])
 
 
 def _expire(job_dir: Path, timeout_s: float) -> None:

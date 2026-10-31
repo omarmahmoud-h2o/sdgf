@@ -458,6 +458,43 @@ sandbox (it can still reach the network and the file system), so `--hooks` defau
 Dry runs use `--dry-run-backends`, check L1–L4 only, make at most `--dry-run-max-target`
 records, and write to the drafts' own store, apart from real runs.
 
+**A shared server.** To serve several teams or harnesses over the network, give each a
+token and run with `--clients`:
+
+```bash
+python -m sdgf.clients new team-a      # prints the token (give it to team-a) and its entry
+# clients.json: {"clients": [{"id": "team-a", "token_sha256": "...", "max_running": 2,
+#                             "max_tokens": 5000000, "max_cost_usd": 50, "allow_hooks": false}]}
+python -m sdgf.mcp --store ... --tasks tasks/ --releases ... --drafts ... \
+    --http --host 0.0.0.0 --clients clients.json --public-url https://sdgf.example \
+    [--held-out heldout.jsonl ...] [--trace langsmith]
+```
+
+Every call must then carry `Authorization: Bearer <token>`. A client sees and controls
+only its own jobs and drafts (drafts go under `<drafts>/<client id>/`, so a person
+reviews them with `sdgf drafts --drafts <drafts>/<client id> ...`); approved tasks are
+shared. A client's `max_running`, `max_tokens` and `max_cost_usd` are checked before each
+job starts, against what its runs have used so far (`my_usage`); runs on unpriced models
+count tokens but not cost. Every tool call, by whom, with its arguments (long text and
+lists by size only) and outcome, goes to `<store>/audit.jsonl`, and each run lists the
+jobs and clients that touched it in its `jobs.json`. Tokens travel in the clear over plain
+HTTP, so put TLS in front. `--held-out` files turn on the L4 held-out check for every real
+run without being written anywhere (not even in a job's directory); dry runs never use
+them. `--trace` traces every run and release job, tagged `job:<id>` and `client:<id>`.
+
+From a Python harness, `sdgf.client` calls the same tools:
+
+```python
+from sdgf.client import SdgfClient
+
+async with SdgfClient("https://sdgf.example/mcp", token=TOKEN) as sdgf:
+    job = await sdgf.call("start_run", task="fag", target_size=200)
+    done = await sdgf.wait(job["job_id"])
+```
+
+A harness on the same machine as the store can use `sdgf.service.Service` and
+`sdgf.jobs.JobManager` directly instead.
+
 ## Optional adapters
 
 Heavy engines are imported lazily, only when you build their adapter. The core and the
@@ -522,6 +559,8 @@ src/sdgf/
   hitl/        review queue, plan approval
   service/     Service: every step as a call returning data (the CLI is a thin adapter); TaskRegistry
   jobs.py      JobManager: run / resume / evaluate / release as background processes
+  drafts.py    DraftStore: agent-written task specs, approved by a person
+  mcp/         the MCP server agents use; clients.py (tokens, limits), client.py (Python caller)
   pipeline.py  cli.py
 tasks/fag/     task.yaml hooks.py seeds.jsonl
 tasks/cfa/     task.yaml seeds.jsonl
