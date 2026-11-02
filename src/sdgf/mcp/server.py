@@ -604,9 +604,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tasks", required=True, nargs="+", type=Path, help="directories of task specs")
     p.add_argument("--releases", type=Path, help="release root; without it, no start_release")
     p.add_argument("--backends", metavar="MODULE:ATTR", help="model overrides for every job")
-    p.add_argument("--max-running", type=int, default=DEFAULT_MAX_RUNNING)
+    p.add_argument(
+        "--max-running", type=int, default=DEFAULT_MAX_RUNNING, help="jobs running at once"
+    )
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="per job, seconds")
-    p.add_argument("--max-target-size", type=int)
+    p.add_argument("--max-target-size", type=int, help="the largest target size a job may ask for")
     p.add_argument(
         "--waivable",
         nargs="+",
@@ -625,10 +627,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="may agents write a draft's hooks.py (default: allow over stdio, deny over --http)",
     )
     p.add_argument("--dry-run-backends", metavar="MODULE:ATTR", help="test models for dry runs")
-    p.add_argument("--dry-run-max-target", type=int, default=10)
+    p.add_argument(
+        "--dry-run-max-target", type=int, default=10, help="the most records a dry run makes"
+    )
     p.add_argument("--http", action="store_true", help="streamable HTTP instead of stdio")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--host", default="127.0.0.1", help="the address --http binds to")
+    p.add_argument("--port", type=int, default=8765, help="the port --http listens on")
     p.add_argument("--clients", type=Path, help="clients file (sdgf.clients); HTTP only")
     p.add_argument("--public-url", help="the URL clients reach this server at (with --clients)")
     return p

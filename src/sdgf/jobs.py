@@ -73,8 +73,19 @@ HELD_OUT_ENV = "SDGF_JOB_HELD_OUT"  # held-out paths reach a worker only through
 _SRC_ROOT = Path(__file__).resolve().parents[1]  # the directory holding the sdgf package
 
 # What a worker keeps of the caller's environment when it must not inherit the rest
-# (e.g. API keys) because it runs code an agent wrote.
-ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ", "SYSTEMROOT")
+# (e.g. API keys) because it runs code an agent wrote. PYTHONPATH is the operator's (an
+# agent can't set it) and is how a worker finds modules such as --dry-run-backends.
+ENV_KEEP = (
+    "PATH",
+    "PYTHONPATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TZ",
+    "SYSTEMROOT",
+)
 
 
 def child_env(extra: Mapping[str, str] = {}, *, inherit: bool = True) -> dict[str, str]:

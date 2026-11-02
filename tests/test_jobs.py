@@ -10,7 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from sdgf.jobs import CANCELLED, FAILED, FINISHED, LOST, RUNNING, TIMED_OUT, JobManager
+from sdgf.jobs import (
+    CANCELLED,
+    FAILED,
+    FINISHED,
+    LOST,
+    RUNNING,
+    TIMED_OUT,
+    JobManager,
+    child_env,
+)
 from sdgf.service import RunOptions, Service, ServiceError, TaskRegistry
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -194,3 +203,15 @@ def test_held_out_files_reach_the_worker_but_are_never_written(tmp_path):
     for path in (tmp_path / "store").rglob("*"):
         if path.is_file():
             assert held.name not in path.read_text(errors="ignore"), path
+
+
+def test_a_worker_without_the_callers_environment_keeps_its_pythonpath(tmp_path, monkeypatch):
+    # As from `python -m sdgf.mcp --dry-run-backends cli_backends:...`: no env passed, so
+    # the backends module is found only through the operator's PYTHONPATH.
+    monkeypatch.setenv("PYTHONPATH", ENV["PYTHONPATH"])
+    monkeypatch.setenv("SDGF_TEST_API_KEY", "s3cret")
+    env = child_env(inherit=False)
+    assert "SDGF_TEST_API_KEY" not in env and str(ROOT / "tests") in env["PYTHONPATH"]
+    jobs = JobManager(tmp_path / "store", backends="cli_backends:fag_world", inherit_env=False)
+    done = finished(jobs, jobs.start("run", TASKS / "fag", options=NO_JUDGE)["job_id"])
+    assert done["data"]["accepted"] == TARGET

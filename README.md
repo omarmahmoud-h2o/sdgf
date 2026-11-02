@@ -9,7 +9,9 @@ evaluation, the release gate and provenance. The design is in
 Start with [docs/overview.md](docs/overview.md) for what sdgf produces and what it can't
 guarantee. [docs/how-it-works.md](docs/how-it-works.md) walks through a run and each of the
 six checks. [docs/new-use-case.md](docs/new-use-case.md) explains how to set up a new
-dataset. Terms are defined in [CONTEXT.md](CONTEXT.md).
+dataset. Terms are defined in [CONTEXT.md](CONTEXT.md). [docs/tutorial.md](docs/tutorial.md)
+walks through everything hands-on, offline: the pipeline, jobs, agents over MCP, agent-written
+tasks and a shared server.
 [docs/sdgf-guide.html](docs/sdgf-guide.html) is all three in one interactive page that works
 offline: open it in a browser. It is generated from the markdown, so edit the `.md` files
 and rerun `python docs/build_guide.py` (needs the `docs` extra).
