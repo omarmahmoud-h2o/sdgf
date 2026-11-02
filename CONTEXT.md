@@ -101,3 +101,17 @@ _Avoid_: export, snapshot
 **Audit trail** (`provenance`):
 The per-record log of the spec version, models, prompt hash, seed, cell and every check result.
 _Avoid_: provenance, lineage
+
+## Agents
+
+**Job**:
+One long step (a run, resume, evaluation or release) running in its own process, which a caller starts and then follows by its id.
+_Avoid_: task, process
+
+**Draft**:
+A task spec an agent is writing, kept apart from the task directories until a person approves it.
+_Avoid_: proposal, candidate
+
+**Client**:
+A caller of a shared sdgf server, known by its token, with its own jobs, drafts and limits.
+_Avoid_: user, tenant

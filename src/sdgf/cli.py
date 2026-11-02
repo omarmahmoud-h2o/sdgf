@@ -7,10 +7,12 @@
     sdgf evaluate TASK --store S [--run-id R]    stages 4 and 5 over a run, read only
     sdgf review TASK --store S list|resolve      the run's HITL review queue
     sdgf release TASK --store S --releases DIR   stages 0 to 5 with refill rounds
+    sdgf drafts --drafts D list|show|approve|reject   review task specs agents wrote
 
 Every command prints one JSON object on stdout. Exit codes: 0 done, 1 finished but not
 complete (a run stopped short, a failed gate, no release), 2 an error, 3 the coverage plan
-awaits approval (sdgf plan --approve).
+awaits approval (sdgf plan --approve). Each command is a thin adapter over sdgf.service:
+it maps arguments to a Service call and prints the Outcome.
 
 Models come from spec.models. --backends MODULE:ATTR (or path/to/file.py:ATTR) names a
 callable taking the CompiledSpec and returning {stage: ModelBackend}, which replaces
@@ -34,44 +36,32 @@ import importlib
 import importlib.util
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
-from sdgf.coverage.axes import keyword_sources
-from sdgf.coverage.plan import DEFAULT_SEED, load_or_build_plan, plan_stage_name
-from sdgf.evaluation.gate import evaluate_gate
-from sdgf.evaluation.metrics import metrics_for_run
-from sdgf.hitl.queue import ApprovalPending, GoldSet, ReviewQueue, approve_plan, plan_approved
-from sdgf.models.base import ModelBackend
-from sdgf.models.registry import REGISTRY as MODELS
-from sdgf.pipeline import DEFAULT_MAX_ROUNDS, Pipeline, RunResult
-from sdgf.spec.compile import CompiledSpec, compile_spec
-from sdgf.store.artefacts import ArtefactStore, new_run_id
-from sdgf.tools.registry import REGISTRY as TOOLS
-from sdgf.tracing import LANGSMITH, Tracer, make_tracer
+from sdgf.coverage.plan import DEFAULT_SEED
+from sdgf.drafts import DraftStore
+from sdgf.hitl.queue import ApprovalPending
+from sdgf.pipeline import DEFAULT_MAX_ROUNDS
+from sdgf.service import (
+    OPTIONS_STAGE,
+    BackendsFactory,
+    Outcome,
+    RunOptions,
+    Service,
+    TraceSettings,
+)
+from sdgf.tracing import LANGSMITH
+
+__all__ = ["OPTIONS_STAGE", "build_parser", "load_backends", "main"]
 
 EXIT_OK = 0
 EXIT_INCOMPLETE = 1
 EXIT_ERROR = 2
 EXIT_APPROVAL = 3
 
-OPTIONS_STAGE = "cli_options"
-RUN_OPTIONS: tuple[str, ...] = (
-    "seed",
-    "target_size",
-    "plan_seed",
-    "layers",
-    "max_attempts_per_cell",
-)
-_RUN_DEFAULTS: dict[str, Any] = {
-    "seed": 0,
-    "target_size": None,
-    "plan_seed": DEFAULT_SEED,
-    "layers": None,
-    "max_attempts_per_cell": None,
-}
-
-BackendsFactory = Callable[[CompiledSpec], Mapping[str, ModelBackend]]
+_EXIT = {"ok": EXIT_OK, "incomplete": EXIT_INCOMPLETE, "approval_pending": EXIT_APPROVAL}
 
 
 class CLIError(ValueError):
@@ -83,6 +73,14 @@ class CLIError(ValueError):
 
 def _print(data: Any) -> None:
     print(json.dumps(data, indent=2, sort_keys=True, default=str))
+
+
+def _emit(outcome: Outcome) -> int:
+    if outcome.status == "approval_pending":
+        print(f"sdgf: {outcome.data['message']}", file=sys.stderr)
+    else:
+        _print(outcome.data)
+    return _EXIT[outcome.status]
 
 
 def load_backends(ref: str) -> BackendsFactory:
@@ -106,130 +104,36 @@ def load_backends(ref: str) -> BackendsFactory:
     return factory
 
 
-def _overrides(args: argparse.Namespace, compiled: CompiledSpec) -> dict[str, ModelBackend]:
-    if not getattr(args, "backends", None):
-        return {}
-    overrides = dict(load_backends(args.backends)(compiled))
-    bad = [st for st, b in overrides.items() if not isinstance(b, ModelBackend)]
-    if bad:
-        raise CLIError(f"--backends returned non-backends for stages {bad}")
-    return overrides
+def _backends(args: argparse.Namespace) -> BackendsFactory | None:
+    """--backends, loaded only when the service first needs a model, as before."""
+    ref = getattr(args, "backends", None)
+    if not ref:
+        return None
+    return lambda compiled: load_backends(ref)(compiled)
 
 
-def _compile(args: argparse.Namespace) -> CompiledSpec:
-    return compile_spec(args.task, tool_registry=TOOLS)
-
-
-def _store(args: argparse.Namespace) -> ArtefactStore:
-    return ArtefactStore(args.store)
-
-
-def _run_exists(store: ArtefactStore, spec_version: str, run_id: str) -> bool:
-    return run_id in store.runs(spec_version)
-
-
-def _run_options(
-    args: argparse.Namespace,
-    store: ArtefactStore,
-    compiled: CompiledSpec,
-    run_id: str,
-) -> dict[str, Any]:
-    """The run's saved options, checked against any passed explicitly, else the given ones."""
-    given = {k: getattr(args, k, None) for k in RUN_OPTIONS}
-    given = {k: (list(v) if k == "layers" else v) for k, v in given.items() if v is not None}
-    if _run_exists(store, compiled.spec_version, run_id):
-        run = store.open_run(compiled.spec_version, run_id)
-        if run.has_stage(OPTIONS_STAGE):
-            saved = run.read_stage(OPTIONS_STAGE)
-            clash = sorted(k for k, v in given.items() if saved.get(k) != v)
-            if clash:
-                raise CLIError(
-                    f"run {run_id!r} was started with "
-                    + ", ".join(f"{k}={saved.get(k)!r}" for k in clash)
-                    + "; start a new run to change them"
-                )
-            return {k: saved.get(k, _RUN_DEFAULTS[k]) for k in RUN_OPTIONS}
-    return {**_RUN_DEFAULTS, **given}
-
-
-def _save_options(
-    store: ArtefactStore, compiled: CompiledSpec, run_id: str, options: Mapping[str, Any]
-) -> None:
-    """Called once the pipeline is built, so bad arguments leave no run directory behind."""
-    run = store.open_run(compiled.spec_version, run_id)
-    if not run.has_stage(OPTIONS_STAGE):
-        run.write_stage(OPTIONS_STAGE, dict(options))
-
-
-def _pipeline(
-    args: argparse.Namespace,
-    store: ArtefactStore,
-    compiled: CompiledSpec,
-    options: Mapping[str, Any],
-) -> Pipeline:
-    return Pipeline(
-        compiled,
-        store,
-        model_overrides=_overrides(args, compiled),
-        seed=options["seed"],
-        target_size=options["target_size"],
-        plan_seed=options["plan_seed"],
-        layers=options["layers"],
-        max_attempts_per_cell=options["max_attempts_per_cell"],
-        held_out_paths=args.held_out or None,
-        ignore_unused_overrides=True,
-        tracer=_tracer(args, compiled),
+def _service(args: argparse.Namespace) -> Service:
+    return Service(
+        getattr(args, "store", None),
+        notify=lambda message: print(f"sdgf: {message}", file=sys.stderr),
     )
 
 
-def _tracer(args: argparse.Namespace, compiled: CompiledSpec) -> Tracer | None:
+def _options(args: argparse.Namespace) -> RunOptions:
+    return RunOptions(
+        seed=args.seed,
+        target_size=args.target_size,
+        plan_seed=args.plan_seed,
+        layers=args.layers,
+        max_attempts_per_cell=args.max_attempts_per_cell,
+    )
+
+
+def _trace(args: argparse.Namespace) -> TraceSettings | None:
     kind = getattr(args, "trace", None)
     if kind is None:
         return None
-    project = args.trace_project or f"sdgf-{compiled.spec.task.name}"
-    tracer = make_tracer(kind, project=project, tags=args.trace_tags or ())
-    sink = tracer.sink or {}
-    print(
-        f"sdgf: tracing to {kind} ({sink.get('endpoint')}), project {project!r}, "
-        f"{sink.get('content', 'full')} content",
-        file=sys.stderr,
-    )
-    return tracer
-
-
-def _existing_run_id(args: argparse.Namespace, store: ArtefactStore, compiled: CompiledSpec) -> str:
-    """--run-id if given and present, else the latest run of this spec_version."""
-    if args.run_id is not None:
-        if not _run_exists(store, compiled.spec_version, args.run_id):
-            raise CLIError(f"no run {args.run_id!r} for spec_version {compiled.spec_version}")
-        return args.run_id
-    latest = store.latest_run(compiled.spec_version)
-    if latest is None:
-        raise CLIError(f"no runs for spec_version {compiled.spec_version} in {store.root}")
-    return latest
-
-
-def _run_report(result: RunResult) -> dict[str, Any]:
-    return {
-        "run_id": result.run.run_id,
-        "run_dir": str(result.run.path),
-        "spec_version": result.run.spec_version,
-        "accepted_this_invocation": len(result.accepted),
-        "accepted": sum(result.counts.values()),
-        "counts": result.counts,
-        "stop_reason": result.stop_reason,
-        "complete": result.complete,
-        "layers": list(result.layers),
-        "skipped_layers": list(result.skipped_layers),
-        "drops_by_layer": result.drops.by_layer(),
-        "usage": result.usage.get("total"),
-        "cost_per_accepted": _per_record(result.usage.get("total", {}).get("cost_usd"), result),
-    }
-
-
-def _per_record(total: float | None, result: RunResult) -> float | None:
-    n = sum(result.counts.values())
-    return None if total is None or not n else total / n
+    return TraceSettings(kind, project=args.trace_project, tags=tuple(args.trace_tags or ()))
 
 
 def _parse_label(text: str) -> Any:
@@ -244,172 +148,109 @@ def _parse_label(text: str) -> Any:
 
 
 def cmd_validate_spec(args: argparse.Namespace) -> int:
-    compiled = _compile(args)
-    spec = compiled.spec
-    _print(
-        {
-            "ok": True,
-            "task": spec.task.name,
-            "task_version": spec.task.version,
-            "task_type": spec.task.type,
-            "generation_mode": spec.task.generation_mode,
-            "spec_version": compiled.spec_version,
-            "seeds": len(compiled.seeds),
-            "layers": list(spec.validation.layers),
-        }
-    )
-    return EXIT_OK
+    return _emit(_service(args).validate_spec(args.task))
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
-    compiled = _compile(args)
-    store = _store(args)
-    stage = plan_stage_name(compiled, args.target_size, args.plan_seed)
-    backend = None
-    if keyword_sources(compiled.spec.coverage) and not store.has_shared(
-        compiled.spec_version, stage
-    ):
-        # Only a keyword expansion needs a model, and only when no plan is cached yet.
-        backend = _overrides(args, compiled).get("expansion")
-        if backend is None:
-            config = compiled.spec.models.expansion
-            if config is None:
-                raise CLIError("the coverage plan needs keyword expansion; set models.expansion")
-            backend = MODELS.create(config)
-            backend.setup()
-    plan, built = load_or_build_plan(
-        store, compiled, target_size=args.target_size, seed=args.plan_seed, backend=backend
+    if args.approve and not args.reviewer:
+        raise CLIError("--approve needs --reviewer")
+    return _emit(
+        _service(args).plan(
+            args.task,
+            target_size=args.target_size,
+            plan_seed=args.plan_seed,
+            approve_as=args.reviewer if args.approve else None,
+            note=args.note,
+            backends=_backends(args),
+        )
     )
-    if args.approve:
-        if not args.reviewer:
-            raise CLIError("--approve needs --reviewer")
-        approve_plan(store, compiled.spec_version, stage, reviewer=args.reviewer, note=args.note)
-    _print(
-        {
-            "spec_version": compiled.spec_version,
-            "plan_stage": stage,
-            "path": str(store.shared_path(compiled.spec_version, stage)),
-            "built": built,
-            "target_size": plan.target_size,
-            "cells": [{"id": c.id, "quota": c.quota} for c in plan.cells],
-            "approval_required": compiled.spec.hitl.approve_coverage_plan,
-            "approved": plan_approved(store, compiled.spec_version, stage),
-        }
-    )
-    return EXIT_OK
-
-
-def _do_run(args: argparse.Namespace, run_id: str) -> int:
-    compiled = _compile(args)
-    store = _store(args)
-    options = _run_options(args, store, compiled, run_id)
-    pipe = _pipeline(args, store, compiled, options)
-    _save_options(store, compiled, run_id, options)
-    result = pipe.run(run_id)
-    _print(_run_report(result))
-    return EXIT_OK if result.complete else EXIT_INCOMPLETE
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    return _do_run(args, args.run_id or new_run_id())
+    return _emit(
+        _service(args).run(
+            args.task,
+            args.run_id,
+            options=_options(args),
+            held_out=args.held_out,
+            backends=_backends(args),
+            trace=_trace(args),
+        )
+    )
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    compiled = _compile(args)
-    return _do_run(args, _existing_run_id(args, _store(args), compiled))
+    return _emit(
+        _service(args).resume(
+            args.task,
+            args.run_id,
+            options=_options(args),
+            held_out=args.held_out,
+            backends=_backends(args),
+            trace=_trace(args),
+        )
+    )
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
-    compiled = _compile(args)
-    store = _store(args)
-    run_id = _existing_run_id(args, store, compiled)
-    options = _run_options(args, store, compiled, run_id)
-    pipe = _pipeline(args, store, compiled, options)
-    run = store.open_run(compiled.spec_version, run_id)
-    if not run.has_stage("cells"):
-        raise CLIError(f"run {run_id!r} has not generated anything yet")
-    metrics = metrics_for_run(
-        compiled,
-        run,
-        calibration=pipe.calibration,
-        held_out_paths=pipe.held_out_paths,
-        seed=pipe.seed,
+    return _emit(
+        _service(args).evaluate(
+            args.task,
+            args.run_id,
+            options=_options(args),
+            held_out=args.held_out,
+            backends=_backends(args),
+            waive=args.waive,
+        )
     )
-    gate = evaluate_gate(metrics, compiled.spec.thresholds, waive=args.waive)
-    _print(
-        {
-            "run_id": run_id,
-            "passed": gate.passed,
-            "gate": gate.to_dict(),
-            "metrics": metrics.to_dict(),
-        }
-    )
-    return EXIT_OK if gate.passed else EXIT_INCOMPLETE
 
 
 def cmd_release(args: argparse.Namespace) -> int:
-    compiled = _compile(args)
-    store = _store(args)
-    run_id = args.run_id or new_run_id()
-    options = _run_options(args, store, compiled, run_id)
-    pipe = _pipeline(args, store, compiled, options)
-    _save_options(store, compiled, run_id, options)
-    result = pipe.release(
-        args.releases,
-        run_id,
-        max_rounds=args.max_rounds,
-        waive=args.waive,
-        version=args.version,
+    return _emit(
+        _service(args).release(
+            args.task,
+            args.releases,
+            args.run_id,
+            options=_options(args),
+            held_out=args.held_out,
+            backends=_backends(args),
+            trace=_trace(args),
+            max_rounds=args.max_rounds,
+            waive=args.waive,
+            version=args.version,
+        )
     )
-    _print(
-        {
-            "run_id": run_id,
-            "released": result.released,
-            "path": str(result.path),
-            "stop_reason": result.stop_reason,
-            "failing_metrics": result.gate.failing_metrics,
-            "short_cells": dict(result.gate.short_cells),
-            "rounds": result.rounds,
-        }
-    )
-    return EXIT_OK if result.released else EXIT_INCOMPLETE
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    compiled = _compile(args)
-    store = _store(args)
-    run_id = _existing_run_id(args, store, compiled)
-    run = store.open_run(compiled.spec_version, run_id)
-    gold = GoldSet.for_task(store, compiled.spec.task.name)
-    queue = ReviewQueue.for_run(run, gold)
+    service = _service(args)
     if args.review_command == "list":
-        pending = queue.pending()
-        _print(
-            {
-                "run_id": run_id,
-                "pending": [
-                    {
-                        "id": i,
-                        "cell_id": d.get("cell_id"),
-                        "layer": d.get("layer"),
-                        "code": d.get("code"),
-                        "intended_label": d.get("intended_label"),
-                        "reason": d.get("reason"),
-                    }
-                    for i, d in pending.items()
-                ],
-                "resolved": len(queue.resolutions()),
-            }
+        return _emit(service.review_list(args.task, args.run_id))
+    return _emit(
+        service.review_resolve(
+            args.task,
+            args.item,
+            args.action,
+            reviewer=args.reviewer,
+            run_id=args.run_id,
+            reason=args.reason,
+            new_label=None if args.new_label is None else _parse_label(args.new_label),
         )
-        return EXIT_OK
-    resolution = queue.resolve(
-        args.item,
-        args.action,
-        reviewer=args.reviewer,
-        reason=args.reason,
-        new_label=None if args.new_label is None else _parse_label(args.new_label),
     )
-    _print({"run_id": run_id, "gold": str(gold.path), **resolution.to_dict()})
+
+
+def cmd_drafts(args: argparse.Namespace) -> int:
+    drafts = DraftStore(args.drafts, approved_root=getattr(args, "into", None))
+    if args.drafts_command == "list":
+        _print({"drafts": drafts.list()})
+    elif args.drafts_command == "show":
+        _print({**drafts.review(args.name), "validation": drafts.validate(args.name)})
+    elif args.drafts_command == "approve":
+        _print(
+            drafts.approve(args.name, reviewer=args.reviewer, note=args.note, replace=args.replace)
+        )
+    else:
+        _print(drafts.reject(args.name, reviewer=args.reviewer, reason=args.reason))
     return EXIT_OK
 
 
@@ -524,6 +365,30 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--reason")
     r.add_argument("--new-label", help="the label for relabel, as JSON (e.g. true)")
     p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser(
+        "drafts",
+        help="review task specs agents wrote: list, show, approve or reject",
+        description="A person's side of agent authoring: approving copies the submitted "
+        "draft into a task directory, where runs can use it.",
+    )
+    p.add_argument("--drafts", required=True, help="the drafts workspace")
+    drafts = p.add_subparsers(dest="drafts_command", required=True)
+    drafts.add_parser("list", help="every draft and its state")
+    d = drafts.add_parser("show", help="a draft's files, diff and validation, for review")
+    d.add_argument("name")
+    d.add_argument("--into", help="the approved task root, to diff against the task it replaces")
+    d = drafts.add_parser("approve", help="copy a submitted draft into a task directory")
+    d.add_argument("name")
+    d.add_argument("--reviewer", required=True)
+    d.add_argument("--into", required=True, help="the approved task root, e.g. tasks/")
+    d.add_argument("--note")
+    d.add_argument("--replace", action="store_true", help="overwrite a task of that name")
+    d = drafts.add_parser("reject", help="send a submitted draft back with a reason")
+    d.add_argument("name")
+    d.add_argument("--reviewer", required=True)
+    d.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_drafts)
     return parser
 
 

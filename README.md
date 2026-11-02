@@ -9,7 +9,9 @@ evaluation, the release gate and provenance. The design is in
 Start with [docs/overview.md](docs/overview.md) for what sdgf produces and what it can't
 guarantee. [docs/how-it-works.md](docs/how-it-works.md) walks through a run and each of the
 six checks. [docs/new-use-case.md](docs/new-use-case.md) explains how to set up a new
-dataset. Terms are defined in [CONTEXT.md](CONTEXT.md).
+dataset. Terms are defined in [CONTEXT.md](CONTEXT.md). [docs/tutorial.md](docs/tutorial.md)
+walks through everything hands-on, offline: the pipeline, jobs, agents over MCP, agent-written
+tasks and a shared server.
 [docs/sdgf-guide.html](docs/sdgf-guide.html) is all three in one interactive page that works
 offline: open it in a browser. It is generated from the markdown, so edit the `.md` files
 and rerun `python docs/build_guide.py` (needs the `docs` extra).
@@ -402,6 +404,99 @@ release lists it under `trace_sinks` in `governance_report.json` and in the data
 Held-out matches are scrubbed: an L4 issue against the held-out set reaches a span without
 its key or message. `sdgf plan` and judge calibration aren't traced.
 
+## Using sdgf from agents (MCP)
+
+`python -m sdgf.mcp` serves the tasks under one or more directories to MCP clients
+(Claude Code, the Claude Agent SDK, other agents). Agents name tasks; they never pass
+paths. You, the operator, fix everything that costs money or is a person's decision:
+
+```bash
+pip install -e '.[mcp]'
+python -m sdgf.mcp --store /srv/sdgf/store --tasks tasks/ --releases /srv/sdgf/releases \
+    [--max-running 2] [--timeout 3600] [--max-target-size 500] [--waivable kappa_min ...] \
+    [--http [--host 127.0.0.1] [--port 8765]]
+claude mcp add sdgf -- python -m sdgf.mcp --store ... --tasks tasks/   # e.g. in Claude Code
+```
+
+| Tools | |
+|---|---|
+| `list_tasks`, `describe_task`, `validate_spec`, `plan` | quick, answered at once |
+| `start_run`, `start_release`, `start_evaluate` | start a job and return its id at once |
+| `job_status`, `wait_job`, `list_jobs`, `cancel_job`, `restart_job` | follow, stop and continue jobs |
+| `get_records`, `list_reviews` | read results, a page of records at a time |
+
+Jobs (`sdgf.jobs`) run each step in its own process with its state under
+`<store>/jobs/`, so they outlive the server, and `restart_job` continues a cancelled,
+timed-out or lost job's run without generating accepted records again. A job status is
+brief unless `detail=True`.
+
+Not tools, on purpose: approving a coverage plan and resolving review items stay with a
+person (`sdgf plan --approve`, `sdgf review resolve`); the tools say what is waiting.
+Agents can waive only the thresholds in `--waivable`, never governance. `--backends`
+applies to every job and is the operator's choice, not the agent's. The quick tools
+import the task's `hooks.py` in the server process, so serve only tasks you trust.
+`--http` has no authentication yet and binds only to a loopback address.
+
+**Agents writing tasks.** With `--drafts DIR`, agents also get `list_drafts`,
+`create_draft` (empty, or a copy of a task), `read_draft`, `write_draft_file`,
+`append_seeds`, `delete_draft_file`, `validate_draft`, `dry_run_draft` and `submit_draft`.
+Drafts live in their own workspace; only a person can turn one into a task:
+
+```bash
+python -m sdgf.mcp ... --drafts /srv/sdgf/drafts --dry-run-backends cli_backends:fag_world \
+    [--dry-run-max-target 10] [--hooks allow|deny]
+python -m sdgf.cli drafts --drafts /srv/sdgf/drafts list
+python -m sdgf.cli drafts --drafts /srv/sdgf/drafts show NAME --into tasks/   # files, diff, validation
+python -m sdgf.cli drafts --drafts /srv/sdgf/drafts approve NAME --reviewer "A. Reviewer" --into tasks/
+python -m sdgf.cli drafts --drafts /srv/sdgf/drafts reject NAME --reviewer "A. Reviewer" --reason "..."
+```
+
+Approval binds to the exact bytes submitted: any edit afterwards withdraws it, so a
+person approves only what they saw. A draft's `hooks.py` is code an agent wrote: it is
+imported only in a subprocess that gets `PATH`, `HOME`, locale and temp settings and
+nothing else of the server's environment (no API keys), with a timeout. That is not a
+sandbox (it can still reach the network and the file system), so `--hooks` defaults to
+`deny` over `--http`; a draft copied from a task keeps that task's approved `hooks.py`.
+Dry runs use `--dry-run-backends`, check L1–L4 only, make at most `--dry-run-max-target`
+records, and write to the drafts' own store, apart from real runs.
+
+**A shared server.** To serve several teams or harnesses over the network, give each a
+token and run with `--clients`:
+
+```bash
+python -m sdgf.clients new team-a      # prints the token (give it to team-a) and its entry
+# clients.json: {"clients": [{"id": "team-a", "token_sha256": "...", "max_running": 2,
+#                             "max_tokens": 5000000, "max_cost_usd": 50, "allow_hooks": false}]}
+python -m sdgf.mcp --store ... --tasks tasks/ --releases ... --drafts ... \
+    --http --host 0.0.0.0 --clients clients.json --public-url https://sdgf.example \
+    [--held-out heldout.jsonl ...] [--trace langsmith]
+```
+
+Every call must then carry `Authorization: Bearer <token>`. A client sees and controls
+only its own jobs and drafts (drafts go under `<drafts>/<client id>/`, so a person
+reviews them with `sdgf drafts --drafts <drafts>/<client id> ...`); approved tasks are
+shared. A client's `max_running`, `max_tokens` and `max_cost_usd` are checked before each
+job starts, against what its runs have used so far (`my_usage`); runs on unpriced models
+count tokens but not cost. Every tool call, by whom, with its arguments (long text and
+lists by size only) and outcome, goes to `<store>/audit.jsonl`, and each run lists the
+jobs and clients that touched it in its `jobs.json`. Tokens travel in the clear over plain
+HTTP, so put TLS in front. `--held-out` files turn on the L4 held-out check for every real
+run without being written anywhere (not even in a job's directory); dry runs never use
+them. `--trace` traces every run and release job, tagged `job:<id>` and `client:<id>`.
+
+From a Python harness, `sdgf.client` calls the same tools:
+
+```python
+from sdgf.client import SdgfClient
+
+async with SdgfClient("https://sdgf.example/mcp", token=TOKEN) as sdgf:
+    job = await sdgf.call("start_run", task="fag", target_size=200)
+    done = await sdgf.wait(job["job_id"])
+```
+
+A harness on the same machine as the store can use `sdgf.service.Service` and
+`sdgf.jobs.JobManager` directly instead.
+
 ## Optional adapters
 
 Heavy engines are imported lazily, only when you build their adapter. The core and the
@@ -415,6 +510,7 @@ test suite never need them.
 | `docs` | `markdown` | not an adapter: `docs/build_guide.py` uses it to build `docs/sdgf-guide.html` |
 | `retrieval` | `rank-bm25` | not required: `coverage/retrieval.py` is a pure-Python BM25 that scores the same as `rank_bm25.BM25Okapi` |
 | `tracing` | `langsmith` | `tracing.LangSmithTracer`, used by `--trace langsmith` (see [Tracing with LangSmith](#tracing-with-langsmith)) |
+| `mcp` | `mcp` (2.x) | `mcp.server.build_server`, the MCP server agents use (see [Using sdgf from agents](#using-sdgf-from-agents-mcp)) |
 
 Install an extra with `pip install -e '.[pii]'`. Model SDKs work the same way:
 `openai_compat` needs only the standard library, `anthropic` uses `anthropic`, `vllm`
@@ -463,6 +559,10 @@ src/sdgf/
   evaluation/  metrics, diversity, gate, reports (stages 4–5)
   store/       artefact store, provenance
   hitl/        review queue, plan approval
+  service/     Service: every step as a call returning data (the CLI is a thin adapter); TaskRegistry
+  jobs.py      JobManager: run / resume / evaluate / release as background processes
+  drafts.py    DraftStore: agent-written task specs, approved by a person
+  mcp/         the MCP server agents use; clients.py (tokens, limits), client.py (Python caller)
   pipeline.py  cli.py
 tasks/fag/     task.yaml hooks.py seeds.jsonl
 tasks/cfa/     task.yaml seeds.jsonl
